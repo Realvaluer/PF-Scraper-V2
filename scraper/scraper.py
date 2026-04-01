@@ -188,6 +188,16 @@ def extract_from_next_data(page_content: str, stored_type: str) -> list[dict]:
                 bedrooms_raw = prop.get("bedrooms", 0)
                 building = prop.get("buildingName", "") or ""
 
+                # Ensure numeric types
+                try:
+                    price = float(price) if price else 0
+                except (ValueError, TypeError):
+                    price = 0
+                try:
+                    size_sqft = float(size_sqft) if size_sqft else 0
+                except (ValueError, TypeError):
+                    size_sqft = 0
+
                 community_name = ""
                 locations = prop.get("location", [])
                 if isinstance(locations, list) and len(locations) >= 2:
@@ -195,10 +205,18 @@ def extract_from_next_data(page_content: str, stored_type: str) -> list[dict]:
                 elif isinstance(locations, list) and len(locations) >= 1:
                     community_name = locations[0].get("name", "") if isinstance(locations[0], dict) else ""
 
-                if bedrooms_raw == 0:
+                # Handle bedrooms — can be int, str, or None
+                try:
+                    bed_num = int(bedrooms_raw)
+                except (ValueError, TypeError):
+                    bed_num = -1
+
+                if bed_num == 0 or str(bedrooms_raw).lower() == "studio":
                     bedrooms = "Studio"
-                elif bedrooms_raw >= 4:
+                elif bed_num >= 4:
                     bedrooms = "4+"
+                elif bed_num > 0:
+                    bedrooms = str(bed_num)
                 else:
                     bedrooms = str(bedrooms_raw)
 
