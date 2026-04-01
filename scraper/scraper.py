@@ -16,21 +16,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# (url_slug, display_label)
 COMMUNITIES = [
-    "downtown-dubai",
-    "dubai-marina",
-    "business-bay",
-    "jumeirah-village-circle-jvc",
-    "palm-jumeirah",
+    ("downtown-dubai", "Downtown Dubai"),
+    ("dubai-marina", "Dubai Marina"),
+    ("business-bay", "Business Bay"),
+    ("jumeirah-village-circle", "Jumeirah Village Circle"),
+    ("palm-jumeirah", "Palm Jumeirah"),
 ]
-
-COMMUNITY_LABELS = {
-    "downtown-dubai": "Downtown Dubai",
-    "dubai-marina": "Dubai Marina",
-    "business-bay": "Business Bay",
-    "jumeirah-village-circle-jvc": "Jumeirah Village Circle",
-    "palm-jumeirah": "Palm Jumeirah",
-}
 
 # (url_prefix, url_word, stored_type)
 LISTING_TYPES = [
@@ -45,15 +38,14 @@ USER_AGENT = (
 )
 
 
-def build_url(community: str, url_prefix: str, url_word: str, page: int) -> str:
+def build_url(community_slug: str, url_prefix: str, url_word: str, page: int) -> str:
     """Build PropertyFinder search URL.
 
-    Sale: /en/buy/apartments-for-sale-in-downtown-dubai
-    Rent: /en/rent/apartments-for-rent-in-downtown-dubai
+    Format: /en/buy/dubai/apartments-for-sale-downtown-dubai.html?page=2
     """
-    base = f"https://www.propertyfinder.ae/en/{url_prefix}/apartments-for-{url_word}-in-{community}"
+    base = f"https://www.propertyfinder.ae/en/{url_prefix}/dubai/apartments-for-{url_word}-{community_slug}.html"
     if page > 1:
-        return f"{base}/page-{page}"
+        return f"{base}?page={page}"
     return base
 
 
@@ -76,6 +68,12 @@ def extract_listings_from_next_data(page_content: str, stored_type: str) -> list
         page_props = data.get("props", {}).get("pageProps", {})
         search_result = page_props.get("searchResult", {})
         properties = search_result.get("properties", [])
+
+        if not properties:
+            # Try alternate data paths
+            properties = page_props.get("properties", [])
+
+        logger.info(f"Found {len(properties)} properties in __NEXT_DATA__")
 
         for prop in properties:
             try:
@@ -143,8 +141,12 @@ def get_total_pages(page_content: str) -> int:
         data = json.loads(raw_json)
         page_props = data.get("props", {}).get("pageProps", {})
         search_result = page_props.get("searchResult", {})
-        return search_result.get("nbPages", 0)
-    except Exception:
+        nb_pages = search_result.get("nbPages", 0)
+        nb_hits = search_result.get("nbHits", 0)
+        logger.info(f"Search result: {nb_hits} hits, {nb_pages} pages")
+        return nb_pages
+    except Exception as e:
+        logger.error(f"Failed to get total pages: {e}")
         return 0
 
 
@@ -153,27 +155,22 @@ def pass_waf_challenge(page) -> bool:
     logger.info("Navigating to PF homepage to pass WAF challenge...")
     try:
         page.goto("https://www.propertyfinder.ae/en/", wait_until="domcontentloaded", timeout=30000)
-        # Wait for the challenge to resolve — WAF sets cookies after JS executes
         time.sleep(10)
-        # Try waiting for any real page content to appear
         try:
             page.wait_for_selector('a[href*="propertyfinder"]', timeout=20000)
             logger.info("WAF challenge passed — homepage loaded")
             return True
         except Exception:
-            # Check if __NEXT_DATA__ is present (another sign of success)
             content = page.content()
             if "__NEXT_DATA__" in content:
                 logger.info("WAF challenge passed — __NEXT_DATA__ found")
                 return True
-            # Last resort: check page title
             title = page.title()
             logger.info(f"Page title after challenge wait: {title}")
             if "propertyfinder" in title.lower() or "property" in title.lower():
                 logger.info("WAF challenge likely passed based on title")
                 return True
             logger.warning("WAF challenge may not have been passed")
-            # Log a snippet of the page to diagnose
             snippet = content[:500]
             logger.info(f"Page snippet: {snippet}")
             return False
@@ -207,7 +204,6 @@ def run_scraper():
         page = context.new_page()
         stealth_sync(page)
 
-        # Remove webdriver flag
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         """)
@@ -220,10 +216,9 @@ def run_scraper():
         time.sleep(random.uniform(3, 5))
 
         # Step 2: Scrape each community
-        for community in COMMUNITIES:
+        for community_slug, community_label in COMMUNITIES:
             for url_prefix, url_word, stored_type in LISTING_TYPES:
-                label = COMMUNITY_LABELS[community]
-                logger.info(f"\n--- Scraping {label} ({stored_type}) ---")
+                logger.info(f"\n--- Scraping {community_label} ({stored_type}) ---")
 
                 community_listings = []
                 page_num = 1
@@ -237,7 +232,7 @@ def run_scraper():
                         )
                         break
 
-                    url = build_url(community, url_prefix, url_word, page_num)
+                    url = build_url(community_slug, url_prefix, url_word, page_num)
                     try:
                         logger.info(f"Page {page_num}: {url}")
                         page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -245,13 +240,12 @@ def run_scraper():
                         # Wait for page to fully render
                         time.sleep(random.uniform(3, 5))
 
-                        # Wait for __NEXT_DATA__ to confirm page loaded
+                        # Wait for __NEXT_DATA__
                         try:
                             page.wait_for_selector(
                                 'script#__NEXT_DATA__', timeout=20000
                             )
                         except Exception:
-                            # Log what we see for debugging
                             title = page.title()
                             logger.warning(
                                 f"__NEXT_DATA__ not found on page {page_num} — "
@@ -269,7 +263,7 @@ def run_scraper():
                             total_pages = get_total_pages(content)
                             if total_pages == 0:
                                 logger.warning(
-                                    f"0 pages found for {label} ({stored_type}) — skipping"
+                                    f"0 pages for {community_label} ({stored_type}) — skipping"
                                 )
                                 break
                             logger.info(f"Total pages: {total_pages}")
@@ -279,9 +273,10 @@ def run_scraper():
                         )
 
                         if not page_listings:
-                            logger.warning(f"0 listings on page {page_num}")
+                            logger.warning(f"0 listings parsed on page {page_num}")
                         else:
                             community_listings.extend(page_listings)
+                            logger.info(f"Parsed {len(page_listings)} listings from page {page_num}")
 
                         # Check if we've reached the last page
                         if page_num >= total_pages:
@@ -303,7 +298,7 @@ def run_scraper():
                     break
 
                 logger.info(
-                    f"✓ {label} ({stored_type}): "
+                    f"✓ {community_label} ({stored_type}): "
                     f"{page_num} pages, {len(community_listings)} listings"
                 )
                 all_listings.extend(community_listings)
