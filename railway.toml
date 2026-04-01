@@ -1,0 +1,11 @@
+[build]
+dockerfilePath = "Dockerfile"
+
+[[services]]
+name = "pf-viewer-v2"
+startCommand = "python viewer/app.py"
+
+[[services]]
+name = "pf-scraper-v2"
+startCommand = "python scraper/scraper.py"
+cronSchedule = "0 2,8,14,20 * * *"
