@@ -496,6 +496,10 @@ def run_scraper():
                     f"✓ {community_label} ({stored_type}): "
                     f"{page_num} pages, {len(community_listings)} listings"
                 )
+                # Upsert after each community/type combo so data appears progressively
+                if community_listings:
+                    logger.info(f"Upserting {len(community_listings)} listings for {community_label} ({stored_type})...")
+                    upsert_listings(community_listings)
                 all_listings.extend(community_listings)
                 # Reset consecutive failures between combos
                 consecutive_failures = 0
