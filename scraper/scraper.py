@@ -17,8 +17,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Scrape targets: latest 50 sale + 50 rent for Dubai apartments and villas
-# PF sorts by newest by default
 SCRAPE_TARGETS = [
     {
         "url": "https://www.propertyfinder.ae/en/buy/dubai/apartments-for-sale.html",
@@ -34,8 +32,7 @@ SCRAPE_TARGETS = [
     },
 ]
 
-MAX_LISTINGS_PER_TARGET = 50
-UPSERT_BATCH_SIZE = 50
+MAX_LISTINGS_PER_TARGET = 20
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -44,100 +41,179 @@ USER_AGENT = (
 )
 
 
-def extract_from_next_data(page_content: str, stored_type: str, property_type: str) -> list[dict]:
-    """Extract listing data from __NEXT_DATA__ JSON."""
-    try:
-        start = page_content.find('id="__NEXT_DATA__"')
-        if start == -1:
-            return []
-        json_start = page_content.find(">", start) + 1
-        json_end = page_content.find("</script>", json_start)
-        raw_json = page_content[json_start:json_end]
-        data = json.loads(raw_json)
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Failed to parse __NEXT_DATA__: {e}")
-        return []
-
+def extract_from_json_ld(page_content: str, stored_type: str, property_type: str) -> list[dict]:
+    """Extract listing data from JSON-LD structured data (primary method)."""
     listings = []
     try:
-        page_props = data.get("props", {}).get("pageProps", {})
-        search_result = page_props.get("searchResult", {})
-        properties = search_result.get("properties", [])
+        pattern = r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>'
+        matches = re.findall(pattern, page_content, re.DOTALL)
 
-        if not properties:
-            properties = page_props.get("properties", [])
-
-        logger.info(f"Found {len(properties)} properties in __NEXT_DATA__")
-
-        for prop in properties:
+        for match in matches:
             try:
-                reference_no = prop.get("referenceNumber", "")
-                price = prop.get("price", 0)
-                size_sqft = prop.get("area", 0)
-                bedrooms_raw = prop.get("bedrooms", 0)
-                building = prop.get("buildingName", "") or ""
-
-                try:
-                    price = float(price) if price else 0
-                except (ValueError, TypeError):
-                    price = 0
-                try:
-                    size_sqft = float(size_sqft) if size_sqft else 0
-                except (ValueError, TypeError):
-                    size_sqft = 0
-
-                community_name = ""
-                locations = prop.get("location", [])
-                if isinstance(locations, list) and len(locations) >= 2:
-                    community_name = locations[1].get("name", "") if isinstance(locations[1], dict) else ""
-                elif isinstance(locations, list) and len(locations) >= 1:
-                    community_name = locations[0].get("name", "") if isinstance(locations[0], dict) else ""
-
-                try:
-                    bed_num = int(bedrooms_raw)
-                except (ValueError, TypeError):
-                    bed_num = -1
-
-                if bed_num == 0 or str(bedrooms_raw).lower() == "studio":
-                    bedrooms = "Studio"
-                elif bed_num >= 4:
-                    bedrooms = "4+"
-                elif bed_num > 0:
-                    bedrooms = str(bed_num)
-                else:
-                    bedrooms = str(bedrooms_raw)
-
-                price_per_sqft = round(price / size_sqft, 2) if size_sqft and price else 0
-
-                listing_url = prop.get("url", "")
-                if listing_url and not listing_url.startswith("http"):
-                    listing_url = f"https://www.propertyfinder.ae{listing_url}"
-
-                listings.append({
-                    "reference_no": reference_no,
-                    "listing_type": stored_type,
-                    "property_type": property_type,
-                    "community": community_name,
-                    "building": building,
-                    "bedrooms": bedrooms,
-                    "size_sqft": size_sqft,
-                    "price": price,
-                    "price_per_sqft": price_per_sqft,
-                    "listing_url": listing_url,
-                })
-            except Exception as e:
-                logger.warning(f"Failed to parse listing: {e}")
+                data = json.loads(match)
+            except json.JSONDecodeError:
                 continue
 
+            # Find itemListElement
+            item_list = None
+            if isinstance(data, dict):
+                if "mainEntity" in data:
+                    main = data["mainEntity"]
+                    if isinstance(main, dict) and "itemListElement" in main:
+                        item_list = main["itemListElement"]
+                if not item_list and "itemListElement" in data:
+                    item_list = data["itemListElement"]
+
+            if not item_list:
+                continue
+
+            logger.info(f"Found {len(item_list)} items in JSON-LD")
+
+            for item in item_list:
+                try:
+                    # item can be {item: {...}} or direct property
+                    prop = item.get("item", item) if isinstance(item, dict) else item
+
+                    # Reference number from @id
+                    ref_no = str(prop.get("@id", ""))
+
+                    # URL
+                    url = prop.get("url", "")
+                    if url and not url.startswith("http"):
+                        url = f"https://www.propertyfinder.ae{url}"
+
+                    # Price from offers
+                    price = 0
+                    offers = prop.get("offers", [])
+                    if isinstance(offers, list) and offers:
+                        offer = offers[0] if isinstance(offers[0], dict) else {}
+                        price_spec = offer.get("priceSpecification", {})
+                        if isinstance(price_spec, dict):
+                            price = price_spec.get("price", 0)
+                        if not price:
+                            price = offer.get("price", 0)
+                    elif isinstance(offers, dict):
+                        price_spec = offers.get("priceSpecification", {})
+                        if isinstance(price_spec, dict):
+                            price = price_spec.get("price", 0)
+                        if not price:
+                            price = offers.get("price", 0)
+                    try:
+                        price = float(str(price).replace(",", "")) if price else 0
+                    except (ValueError, TypeError):
+                        price = 0
+
+                    # Size from floorSize
+                    size_sqft = 0
+                    floor_size = prop.get("floorSize", {})
+                    if isinstance(floor_size, dict):
+                        size_sqft = floor_size.get("value", 0)
+                    try:
+                        size_sqft = float(str(size_sqft).replace(",", "")) if size_sqft else 0
+                    except (ValueError, TypeError):
+                        size_sqft = 0
+
+                    # Community from address
+                    community_name = ""
+                    address = prop.get("address", {})
+                    if isinstance(address, dict):
+                        community_name = address.get("addressLocality", "")
+                        if not community_name:
+                            community_name = address.get("name", "")
+
+                    # Name (contains bedrooms + building info)
+                    name = prop.get("name", "")
+
+                    # Parse bedrooms from name
+                    bedrooms = ""
+                    if "studio" in name.lower():
+                        bedrooms = "Studio"
+                    else:
+                        bed_match = re.search(r"(\d+)\s*(?:bed|br|bedroom)", name, re.IGNORECASE)
+                        if bed_match:
+                            bed_num = int(bed_match.group(1))
+                            bedrooms = "4+" if bed_num >= 4 else str(bed_num)
+
+                    # Building from name — often after "in" or "|"
+                    building = ""
+                    # Try "in BuildingName" pattern
+                    in_match = re.search(r"\bin\s+([A-Z][^|,]+?)(?:\s*[|,]|\s*$)", name)
+                    if in_match:
+                        building = in_match.group(1).strip()
+
+                    # Price per sqft
+                    price_per_sqft = round(price / size_sqft, 2) if size_sqft and price else 0
+
+                    listings.append({
+                        "reference_no": ref_no,
+                        "listing_type": stored_type,
+                        "property_type": property_type,
+                        "community": community_name,
+                        "building": building,
+                        "bedrooms": bedrooms,
+                        "size_sqft": size_sqft,
+                        "price": price,
+                        "price_per_sqft": price_per_sqft,
+                        "listing_url": url,
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to parse JSON-LD listing: {e}")
+                    continue
+
     except Exception as e:
-        logger.error(f"Failed to navigate __NEXT_DATA__: {e}")
+        logger.error(f"Failed to extract JSON-LD: {e}")
 
     return listings
 
 
+def debug_next_data(page_content: str):
+    """Log the actual __NEXT_DATA__ property structure for debugging."""
+    try:
+        start = page_content.find('id="__NEXT_DATA__"')
+        if start == -1:
+            return
+        json_start = page_content.find(">", start) + 1
+        json_end = page_content.find("</script>", json_start)
+        raw_json = page_content[json_start:json_end]
+        data = json.loads(raw_json)
+
+        page_props = data.get("props", {}).get("pageProps", {})
+
+        # Log top-level keys
+        logger.info(f"__NEXT_DATA__ pageProps keys: {list(page_props.keys())}")
+
+        # Try to find properties
+        search_result = page_props.get("searchResult", {})
+        if search_result:
+            logger.info(f"searchResult keys: {list(search_result.keys())}")
+            properties = search_result.get("properties", [])
+            if properties and len(properties) > 0:
+                first = properties[0]
+                logger.info(f"First property keys: {list(first.keys())}")
+                # Log a few key fields
+                for key in ["referenceNumber", "reference", "ref", "id", "price", "area", "size",
+                            "bedrooms", "beds", "bedroom", "buildingName", "building",
+                            "location", "community", "url", "link", "slug"]:
+                    if key in first:
+                        val = first[key]
+                        if isinstance(val, (dict, list)):
+                            logger.info(f"  {key}: {json.dumps(val)[:200]}")
+                        else:
+                            logger.info(f"  {key}: {val}")
+    except Exception as e:
+        logger.error(f"Debug __NEXT_DATA__ failed: {e}")
+
+
 def wait_for_page_content(page) -> str:
-    """Wait for actual page content to load."""
+    """Wait for page content to load."""
     time.sleep(3)
+
+    try:
+        page.wait_for_selector('script[type="application/ld+json"]', timeout=10000)
+        logger.info("Found JSON-LD script tag")
+        return page.content()
+    except Exception:
+        pass
 
     try:
         page.wait_for_selector('script#__NEXT_DATA__', timeout=5000)
@@ -147,14 +223,7 @@ def wait_for_page_content(page) -> str:
         pass
 
     try:
-        page.wait_for_selector('script[type="application/ld+json"]', timeout=5000)
-        logger.info("Found JSON-LD")
-        return page.content()
-    except Exception:
-        pass
-
-    try:
-        page.wait_for_selector('[class*="property-card"], [class*="listing"], [data-testid*="property"]', timeout=10000)
+        page.wait_for_selector('[class*="property-card"], [class*="listing"]', timeout=10000)
         logger.info("Found property card elements")
         return page.content()
     except Exception:
@@ -171,26 +240,25 @@ def wait_for_page_content(page) -> str:
 
 
 def pass_waf_challenge(page) -> bool:
-    """Navigate to PF homepage and wait for WAF challenge to resolve."""
+    """Navigate to PF homepage to pass WAF challenge."""
     logger.info("Navigating to PF homepage to pass WAF challenge...")
     try:
         page.goto("https://www.propertyfinder.ae/en/", wait_until="domcontentloaded", timeout=30000)
         time.sleep(15)
 
-        title = page.title()
         content = page.content()
-        has_next_data = "__NEXT_DATA__" in content
+        has_ld = "application/ld+json" in content
 
-        logger.info(f"Homepage title: {title}, length: {len(content)}, __NEXT_DATA__: {has_next_data}")
+        logger.info(f"Homepage length: {len(content)}, JSON-LD: {has_ld}")
 
-        if has_next_data or len(content) > 50000:
+        if has_ld or len(content) > 50000:
             logger.info("WAF challenge passed")
             return True
 
         logger.warning("WAF challenge may not have passed")
         return False
     except Exception as e:
-        logger.error(f"Failed during WAF challenge: {e}")
+        logger.error(f"WAF challenge failed: {e}")
         return False
 
 
@@ -209,7 +277,6 @@ def run_scraper():
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--single-process",
-                "--disable-extensions",
             ],
         )
         context = browser.new_context(
@@ -225,11 +292,9 @@ def run_scraper():
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         """)
 
-        # Step 1: Pass WAF challenge
         pass_waf_challenge(page)
         time.sleep(random.uniform(3, 5))
 
-        # Step 2: Scrape each target
         for target in SCRAPE_TARGETS:
             label = target["label"]
             stored_type = target["stored_type"]
@@ -255,7 +320,9 @@ def run_scraper():
                     content = wait_for_page_content(page)
 
                     title = page.title()
-                    logger.info(f"Loaded — title: '{title}', length: {len(content)}")
+                    has_ld = "application/ld+json" in content
+                    has_next = "__NEXT_DATA__" in content
+                    logger.info(f"Loaded — title: '{title}', length: {len(content)}, JSON-LD: {has_ld}, __NEXT_DATA__: {has_next}")
 
                     if len(content) < 5000:
                         logger.warning("Page too small — blocked?")
@@ -263,7 +330,12 @@ def run_scraper():
                         time.sleep(random.uniform(5, 10))
                         continue
 
-                    page_listings = extract_from_next_data(content, stored_type, property_type)
+                    # Debug: log __NEXT_DATA__ structure on first page
+                    if page_num == 1:
+                        debug_next_data(content)
+
+                    # Extract using JSON-LD (primary method)
+                    page_listings = extract_from_json_ld(content, stored_type, property_type)
 
                     if not page_listings:
                         logger.warning(f"0 listings on page {page_num}")
@@ -273,11 +345,19 @@ def run_scraper():
                         target_listings.extend(page_listings)
                         logger.info(f"Got {len(page_listings)} listings (total: {len(target_listings)})")
 
-                        # Upsert every page so we don't lose data on crash
+                        # Log first listing for verification
+                        if page_num == 1 and page_listings:
+                            first = page_listings[0]
+                            logger.info(f"Sample listing: ref={first['reference_no']}, "
+                                       f"community={first['community']}, "
+                                       f"price={first['price']}, "
+                                       f"size={first['size_sqft']}, "
+                                       f"beds={first['bedrooms']}")
+
+                        # Upsert after each page
                         logger.info(f"Upserting {len(page_listings)} listings from page {page_num}...")
                         upsert_listings(page_listings)
 
-                    # Stop if we have enough
                     if len(target_listings) >= MAX_LISTINGS_PER_TARGET:
                         target_listings = target_listings[:MAX_LISTINGS_PER_TARGET]
                         break
