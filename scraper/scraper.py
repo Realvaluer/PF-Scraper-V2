@@ -1,6 +1,7 @@
 import json
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone
 
@@ -39,17 +40,122 @@ USER_AGENT = (
 
 
 def build_url(community_slug: str, url_prefix: str, url_word: str, page: int) -> str:
-    """Build PropertyFinder search URL.
-
-    Format: /en/buy/dubai/apartments-for-sale-downtown-dubai.html?page=2
-    """
+    """Build PropertyFinder search URL."""
     base = f"https://www.propertyfinder.ae/en/{url_prefix}/dubai/apartments-for-{url_word}-{community_slug}.html"
     if page > 1:
         return f"{base}?page={page}"
     return base
 
 
-def extract_listings_from_next_data(page_content: str, stored_type: str) -> list[dict]:
+def extract_from_json_ld(page_content: str, stored_type: str) -> list[dict]:
+    """Extract listing data from JSON-LD structured data."""
+    listings = []
+    try:
+        # Find all JSON-LD script tags
+        pattern = r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>'
+        matches = re.findall(pattern, page_content, re.DOTALL)
+
+        for match in matches:
+            try:
+                data = json.loads(match)
+            except json.JSONDecodeError:
+                continue
+
+            # Look for SearchResultsPage or ItemList with listings
+            item_list = None
+            if isinstance(data, dict):
+                if "mainEntity" in data and "itemListElement" in data.get("mainEntity", {}):
+                    item_list = data["mainEntity"]["itemListElement"]
+                elif "itemListElement" in data:
+                    item_list = data["itemListElement"]
+
+            if not item_list:
+                continue
+
+            logger.info(f"Found {len(item_list)} items in JSON-LD")
+
+            for item in item_list:
+                try:
+                    prop = item.get("item", item)
+
+                    # Extract reference number from @id or url
+                    ref_no = str(prop.get("@id", ""))
+                    url = prop.get("url", "")
+                    if url and not url.startswith("http"):
+                        url = f"https://www.propertyfinder.ae{url}"
+
+                    # Extract price
+                    price = 0
+                    offers = prop.get("offers", {})
+                    if isinstance(offers, dict):
+                        price_spec = offers.get("priceSpecification", {})
+                        if isinstance(price_spec, dict):
+                            price = price_spec.get("price", 0)
+                        if not price:
+                            price = offers.get("price", 0)
+                    if isinstance(price, str):
+                        price = float(price.replace(",", "")) if price else 0
+
+                    # Extract size
+                    size_sqft = 0
+                    floor_size = prop.get("floorSize", {})
+                    if isinstance(floor_size, dict):
+                        size_sqft = floor_size.get("value", 0)
+                    if isinstance(size_sqft, str):
+                        size_sqft = float(size_sqft.replace(",", "")) if size_sqft else 0
+
+                    # Extract name for bedrooms info
+                    name = prop.get("name", "")
+
+                    # Parse bedrooms from name (e.g., "2 Bedroom Apartment...")
+                    bedrooms = ""
+                    if "studio" in name.lower():
+                        bedrooms = "Studio"
+                    else:
+                        bed_match = re.search(r"(\d+)\s*(?:bed|br)", name, re.IGNORECASE)
+                        if bed_match:
+                            bed_num = int(bed_match.group(1))
+                            bedrooms = "4+" if bed_num >= 4 else str(bed_num)
+
+                    # Extract community from address
+                    community_name = ""
+                    address = prop.get("address", {})
+                    if isinstance(address, dict):
+                        community_name = address.get("addressLocality", "")
+
+                    # Extract building from name
+                    building = ""
+                    # Building name is often after "in" in the listing name
+                    in_match = re.search(r"\bin\s+(.+?)(?:\s*,|\s*$)", name)
+                    if in_match:
+                        building = in_match.group(1).strip()
+
+                    # Calculate price per sqft
+                    price_per_sqft = round(price / size_sqft, 2) if size_sqft and price else 0
+
+                    listings.append({
+                        "reference_no": ref_no,
+                        "listing_type": stored_type,
+                        "property_type": "apartment",
+                        "community": community_name,
+                        "building": building,
+                        "bedrooms": bedrooms,
+                        "size_sqft": size_sqft,
+                        "price": price,
+                        "price_per_sqft": price_per_sqft,
+                        "listing_url": url,
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to parse JSON-LD listing: {e}")
+                    continue
+
+    except Exception as e:
+        logger.error(f"Failed to extract JSON-LD data: {e}")
+
+    return listings
+
+
+def extract_from_next_data(page_content: str, stored_type: str) -> list[dict]:
     """Extract listing data from __NEXT_DATA__ JSON."""
     try:
         start = page_content.find('id="__NEXT_DATA__"')
@@ -70,7 +176,6 @@ def extract_listings_from_next_data(page_content: str, stored_type: str) -> list
         properties = search_result.get("properties", [])
 
         if not properties:
-            # Try alternate data paths
             properties = page_props.get("properties", [])
 
         logger.info(f"Found {len(properties)} properties in __NEXT_DATA__")
@@ -83,7 +188,6 @@ def extract_listings_from_next_data(page_content: str, stored_type: str) -> list
                 bedrooms_raw = prop.get("bedrooms", 0)
                 building = prop.get("buildingName", "") or ""
 
-                # Extract community name from location array
                 community_name = ""
                 locations = prop.get("location", [])
                 if isinstance(locations, list) and len(locations) >= 2:
@@ -91,7 +195,6 @@ def extract_listings_from_next_data(page_content: str, stored_type: str) -> list
                 elif isinstance(locations, list) and len(locations) >= 1:
                     community_name = locations[0].get("name", "") if isinstance(locations[0], dict) else ""
 
-                # Format bedrooms
                 if bedrooms_raw == 0:
                     bedrooms = "Studio"
                 elif bedrooms_raw >= 4:
@@ -99,10 +202,8 @@ def extract_listings_from_next_data(page_content: str, stored_type: str) -> list
                 else:
                     bedrooms = str(bedrooms_raw)
 
-                # Calculate price per sqft
                 price_per_sqft = round(price / size_sqft, 2) if size_sqft and price else 0
 
-                # Build listing URL
                 listing_url = prop.get("url", "")
                 if listing_url and not listing_url.startswith("http"):
                     listing_url = f"https://www.propertyfinder.ae{listing_url}"
@@ -120,7 +221,7 @@ def extract_listings_from_next_data(page_content: str, stored_type: str) -> list
                     "listing_url": listing_url,
                 })
             except Exception as e:
-                logger.warning(f"Failed to parse individual listing: {e}")
+                logger.warning(f"Failed to parse __NEXT_DATA__ listing: {e}")
                 continue
 
     except Exception as e:
@@ -129,25 +230,56 @@ def extract_listings_from_next_data(page_content: str, stored_type: str) -> list
     return listings
 
 
+def extract_listings(page_content: str, stored_type: str) -> list[dict]:
+    """Try multiple extraction methods."""
+    # Method 1: __NEXT_DATA__
+    listings = extract_from_next_data(page_content, stored_type)
+    if listings:
+        logger.info(f"Extracted {len(listings)} listings via __NEXT_DATA__")
+        return listings
+
+    # Method 2: JSON-LD
+    listings = extract_from_json_ld(page_content, stored_type)
+    if listings:
+        logger.info(f"Extracted {len(listings)} listings via JSON-LD")
+        return listings
+
+    logger.warning("No listings extracted from any method")
+    return []
+
+
 def get_total_pages(page_content: str) -> int:
-    """Extract total pages from __NEXT_DATA__."""
+    """Extract total pages from page content."""
+    # Try __NEXT_DATA__ first
     try:
         start = page_content.find('id="__NEXT_DATA__"')
-        if start == -1:
-            return 0
-        json_start = page_content.find(">", start) + 1
-        json_end = page_content.find("</script>", json_start)
-        raw_json = page_content[json_start:json_end]
-        data = json.loads(raw_json)
-        page_props = data.get("props", {}).get("pageProps", {})
-        search_result = page_props.get("searchResult", {})
-        nb_pages = search_result.get("nbPages", 0)
-        nb_hits = search_result.get("nbHits", 0)
-        logger.info(f"Search result: {nb_hits} hits, {nb_pages} pages")
-        return nb_pages
-    except Exception as e:
-        logger.error(f"Failed to get total pages: {e}")
-        return 0
+        if start != -1:
+            json_start = page_content.find(">", start) + 1
+            json_end = page_content.find("</script>", json_start)
+            raw_json = page_content[json_start:json_end]
+            data = json.loads(raw_json)
+            page_props = data.get("props", {}).get("pageProps", {})
+            search_result = page_props.get("searchResult", {})
+            nb_pages = search_result.get("nbPages", 0)
+            if nb_pages:
+                return nb_pages
+    except Exception:
+        pass
+
+    # Try to find pagination info from JSON-LD numberOfItems
+    try:
+        pattern = r'"numberOfItems"\s*:\s*(\d+)'
+        match = re.search(pattern, page_content)
+        if match:
+            total_items = int(match.group(1))
+            # PF shows ~25 per page
+            pages = (total_items // 25) + (1 if total_items % 25 else 0)
+            logger.info(f"Estimated {pages} pages from {total_items} total items")
+            return min(pages, 100)  # Cap at 100 pages to be safe
+    except Exception:
+        pass
+
+    return 0
 
 
 def pass_waf_challenge(page) -> bool:
@@ -155,28 +287,73 @@ def pass_waf_challenge(page) -> bool:
     logger.info("Navigating to PF homepage to pass WAF challenge...")
     try:
         page.goto("https://www.propertyfinder.ae/en/", wait_until="domcontentloaded", timeout=30000)
-        time.sleep(10)
-        try:
-            page.wait_for_selector('a[href*="propertyfinder"]', timeout=20000)
-            logger.info("WAF challenge passed — homepage loaded")
+        # Wait generously for WAF challenge
+        time.sleep(15)
+
+        # Check if page loaded
+        title = page.title()
+        logger.info(f"Homepage title: {title}")
+
+        content = page.content()
+        has_next_data = "__NEXT_DATA__" in content
+        has_json_ld = "application/ld+json" in content
+        content_length = len(content)
+
+        logger.info(
+            f"Homepage check — length: {content_length}, "
+            f"__NEXT_DATA__: {has_next_data}, JSON-LD: {has_json_ld}"
+        )
+
+        if has_next_data or has_json_ld or content_length > 50000:
+            logger.info("WAF challenge passed — real content detected")
             return True
-        except Exception:
-            content = page.content()
-            if "__NEXT_DATA__" in content:
-                logger.info("WAF challenge passed — __NEXT_DATA__ found")
-                return True
-            title = page.title()
-            logger.info(f"Page title after challenge wait: {title}")
-            if "propertyfinder" in title.lower() or "property" in title.lower():
-                logger.info("WAF challenge likely passed based on title")
-                return True
-            logger.warning("WAF challenge may not have been passed")
-            snippet = content[:500]
-            logger.info(f"Page snippet: {snippet}")
-            return False
+
+        logger.warning("WAF challenge may not have passed — small content or no data tags")
+        logger.info(f"Page snippet: {content[:500]}")
+        return False
     except Exception as e:
         logger.error(f"Failed during WAF challenge: {e}")
         return False
+
+
+def wait_for_page_content(page, timeout: int = 30) -> str:
+    """Wait for actual page content to load, trying multiple signals."""
+    # First wait a bit for initial render
+    time.sleep(3)
+
+    # Try waiting for __NEXT_DATA__
+    try:
+        page.wait_for_selector('script#__NEXT_DATA__', timeout=5000)
+        logger.info("Found __NEXT_DATA__ script tag")
+        return page.content()
+    except Exception:
+        pass
+
+    # Try waiting for JSON-LD
+    try:
+        page.wait_for_selector('script[type="application/ld+json"]', timeout=5000)
+        logger.info("Found JSON-LD script tag")
+        return page.content()
+    except Exception:
+        pass
+
+    # Try waiting for listing cards in the DOM
+    try:
+        page.wait_for_selector('[class*="property-card"], [class*="listing"], [data-testid*="property"]', timeout=10000)
+        logger.info("Found property card elements")
+        return page.content()
+    except Exception:
+        pass
+
+    # Last resort — wait for networkidle and return whatever we have
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+    content = page.content()
+    logger.info(f"Page content length after all waits: {len(content)}")
+    return content
 
 
 def run_scraper():
@@ -208,7 +385,7 @@ def run_scraper():
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         """)
 
-        # Step 1: Pass WAF challenge on homepage first
+        # Step 1: Pass WAF challenge
         waf_passed = pass_waf_challenge(page)
         if not waf_passed:
             logger.warning("WAF challenge may not have passed — continuing anyway")
@@ -225,11 +402,8 @@ def run_scraper():
                 total_pages = None
 
                 while True:
-                    if consecutive_failures >= 3:
-                        logger.error(
-                            "3 consecutive failures — stopping. "
-                            "PF may be blocking or returning challenge pages."
-                        )
+                    if consecutive_failures >= 5:
+                        logger.error("5 consecutive failures — stopping.")
                         break
 
                     url = build_url(community_slug, url_prefix, url_word, page_num)
@@ -237,44 +411,44 @@ def run_scraper():
                         logger.info(f"Page {page_num}: {url}")
                         page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-                        # Wait for page to fully render
-                        time.sleep(random.uniform(3, 5))
+                        content = wait_for_page_content(page)
 
-                        # Wait for __NEXT_DATA__
-                        try:
-                            page.wait_for_selector(
-                                'script#__NEXT_DATA__', timeout=20000
-                            )
-                        except Exception:
-                            title = page.title()
-                            logger.warning(
-                                f"__NEXT_DATA__ not found on page {page_num} — "
-                                f"title: '{title}' — possible challenge page"
-                            )
+                        # Debug: log what we found
+                        has_next = "__NEXT_DATA__" in content
+                        has_ld = "application/ld+json" in content
+                        title = page.title()
+                        logger.info(
+                            f"Page loaded — title: '{title}', "
+                            f"length: {len(content)}, "
+                            f"__NEXT_DATA__: {has_next}, JSON-LD: {has_ld}"
+                        )
+
+                        if len(content) < 5000:
+                            logger.warning("Page content too small — likely blocked")
                             consecutive_failures += 1
                             time.sleep(random.uniform(5, 10))
                             continue
-
-                        content = page.content()
-                        consecutive_failures = 0
 
                         # Get total pages on first page
                         if total_pages is None:
                             total_pages = get_total_pages(content)
                             if total_pages == 0:
                                 logger.warning(
-                                    f"0 pages for {community_label} ({stored_type}) — skipping"
+                                    f"Could not determine pages for {community_label} ({stored_type})"
                                 )
-                                break
+                                # Try with just 1 page
+                                total_pages = 1
+
                             logger.info(f"Total pages: {total_pages}")
 
-                        page_listings = extract_listings_from_next_data(
-                            content, stored_type
-                        )
+                        # Extract listings
+                        page_listings = extract_listings(content, stored_type)
 
                         if not page_listings:
                             logger.warning(f"0 listings parsed on page {page_num}")
+                            consecutive_failures += 1
                         else:
+                            consecutive_failures = 0
                             community_listings.extend(page_listings)
                             logger.info(f"Parsed {len(page_listings)} listings from page {page_num}")
 
@@ -293,7 +467,7 @@ def run_scraper():
                         time.sleep(random.uniform(5, 10))
                         continue
 
-                if consecutive_failures >= 3:
+                if consecutive_failures >= 5:
                     logger.error("Stopping scraper due to repeated failures")
                     break
 
@@ -302,11 +476,12 @@ def run_scraper():
                     f"{page_num} pages, {len(community_listings)} listings"
                 )
                 all_listings.extend(community_listings)
+                # Reset consecutive failures between combos
+                consecutive_failures = 0
 
-                # Delay between community/type combos
                 time.sleep(random.uniform(3, 7))
 
-            if consecutive_failures >= 3:
+            if consecutive_failures >= 5:
                 break
 
         browser.close()
