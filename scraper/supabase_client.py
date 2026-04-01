@@ -11,14 +11,14 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def upsert_listings(listings: list[dict]) -> None:
-    """Upsert listings into pf_listings_v2 in batches of 100."""
+    """Upsert listings into pf_listings_v2 in batches of 50."""
     if not listings:
         logger.info("No listings to upsert")
         return
 
     total_upserted = 0
-    for i in range(0, len(listings), 100):
-        batch = listings[i : i + 100]
+    for i in range(0, len(listings), 50):
+        batch = listings[i : i + 50]
         result = (
             supabase.table("pf_listings_v2")
             .upsert(batch, on_conflict="reference_no,listing_type")
