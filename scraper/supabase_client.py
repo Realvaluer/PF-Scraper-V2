@@ -40,6 +40,14 @@ def upsert_listings(listings: list[dict]) -> None:
 
     listings = sanitize_listings(listings)
 
+    # Deduplicate by (reference_no, listing_type) — keep last occurrence
+    seen = {}
+    for listing in listings:
+        key = (listing.get("reference_no", ""), listing.get("listing_type", ""))
+        seen[key] = listing
+    listings = list(seen.values())
+    logger.info(f"After dedup: {len(listings)} unique listings")
+
     total_upserted = 0
     for i in range(0, len(listings), 50):
         batch = listings[i : i + 50]
