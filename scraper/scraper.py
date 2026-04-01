@@ -207,6 +207,9 @@ def run_scraper():
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--disable-extensions",
             ],
         )
         context = browser.new_context(
@@ -270,6 +273,10 @@ def run_scraper():
                         target_listings.extend(page_listings)
                         logger.info(f"Got {len(page_listings)} listings (total: {len(target_listings)})")
 
+                        # Upsert every page so we don't lose data on crash
+                        logger.info(f"Upserting {len(page_listings)} listings from page {page_num}...")
+                        upsert_listings(page_listings)
+
                     # Stop if we have enough
                     if len(target_listings) >= MAX_LISTINGS_PER_TARGET:
                         target_listings = target_listings[:MAX_LISTINGS_PER_TARGET]
@@ -284,13 +291,7 @@ def run_scraper():
                     time.sleep(random.uniform(5, 10))
                     continue
 
-            logger.info(f"✓ {label}: {len(target_listings)} listings scraped")
-
-            # Upsert immediately
-            if target_listings:
-                logger.info(f"Upserting {len(target_listings)} listings...")
-                upsert_listings(target_listings)
-
+            logger.info(f"✓ {label}: {len(target_listings)} listings scraped and upserted")
             all_listings.extend(target_listings)
             time.sleep(random.uniform(3, 7))
 
