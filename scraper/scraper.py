@@ -27,22 +27,10 @@ SCRAPE_TARGETS = [
         "property_type": "apartment",
     },
     {
-        "url": "https://www.propertyfinder.ae/en/buy/dubai/villas-for-sale.html",
-        "label": "Dubai Villas (sale)",
-        "stored_type": "sale",
-        "property_type": "villa",
-    },
-    {
         "url": "https://www.propertyfinder.ae/en/rent/dubai/apartments-for-rent.html",
         "label": "Dubai Apartments (rent)",
         "stored_type": "rent",
         "property_type": "apartment",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/rent/dubai/villas-for-rent.html",
-        "label": "Dubai Villas (rent)",
-        "stored_type": "rent",
-        "property_type": "villa",
     },
 ]
 
