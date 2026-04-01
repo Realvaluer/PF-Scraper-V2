@@ -1,14 +1,21 @@
 import os
 import re
+import json
 import logging
-from supabase import create_client, Client
+import httpx
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+SUPABASE_URL = os.environ["SUPABASE_URL"].strip()
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"].strip()
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+REST_URL = f"{SUPABASE_URL}/rest/v1/pf_listings_v2"
+HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates",
+}
 
 
 def sanitize_listings(listings: list[dict]) -> list[dict]:
@@ -18,7 +25,6 @@ def sanitize_listings(listings: list[dict]) -> list[dict]:
         clean = {}
         for key, value in listing.items():
             if isinstance(value, str):
-                # Remove non-printable ASCII characters
                 clean[key] = re.sub(r'[^\x20-\x7E]', '', value)
             else:
                 clean[key] = value
@@ -27,7 +33,7 @@ def sanitize_listings(listings: list[dict]) -> list[dict]:
 
 
 def upsert_listings(listings: list[dict]) -> None:
-    """Upsert listings into pf_listings_v2 in batches of 50."""
+    """Upsert listings into pf_listings_v2 via REST API."""
     if not listings:
         logger.info("No listings to upsert")
         return
@@ -38,14 +44,21 @@ def upsert_listings(listings: list[dict]) -> None:
     for i in range(0, len(listings), 50):
         batch = listings[i : i + 50]
         try:
-            result = (
-                supabase.table("pf_listings_v2")
-                .upsert(batch, on_conflict="reference_no,listing_type")
-                .execute()
+            response = httpx.post(
+                REST_URL,
+                headers=HEADERS,
+                json=batch,
+                params={"on_conflict": "reference_no,listing_type"},
+                timeout=30,
             )
-            count = len(result.data) if result.data else 0
-            total_upserted += count
-            logger.info(f"Batch {i // 50 + 1}: upserted {count} rows")
+            if response.status_code in (200, 201):
+                count = len(response.json()) if response.text else len(batch)
+                total_upserted += count
+                logger.info(f"Batch {i // 50 + 1}: upserted {count} rows")
+            else:
+                logger.error(
+                    f"Batch {i // 50 + 1} failed: {response.status_code} — {response.text[:200]}"
+                )
         except Exception as e:
             logger.error(f"Batch {i // 50 + 1} failed: {e}")
 

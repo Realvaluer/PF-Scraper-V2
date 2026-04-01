@@ -1,6 +1,7 @@
 playwright==1.42.0
 playwright-stealth==1.0.6
 supabase==1.2.0
+httpx==0.24.1
 fastapi==0.110.0
 uvicorn==0.29.0
 python-dotenv==1.0.1
