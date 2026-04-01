@@ -32,7 +32,11 @@ COMMUNITY_LABELS = {
     "palm-jumeirah": "Palm Jumeirah",
 }
 
-LISTING_TYPES = ["buy", "rent"]
+# (url_prefix, url_word, stored_type)
+LISTING_TYPES = [
+    ("buy", "sale", "sale"),
+    ("rent", "rent", "rent"),
+]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -41,23 +45,24 @@ USER_AGENT = (
 )
 
 
-def build_url(community: str, listing_type: str, page: int) -> str:
-    """Build PropertyFinder search URL."""
-    # PF uses 'buy' in URL for sale listings
-    base = f"https://www.propertyfinder.ae/en/{listing_type}/apartments-for-{listing_type}-in-{community}"
+def build_url(community: str, url_prefix: str, url_word: str, page: int) -> str:
+    """Build PropertyFinder search URL.
+
+    Sale: /en/buy/apartments-for-sale-in-downtown-dubai
+    Rent: /en/rent/apartments-for-rent-in-downtown-dubai
+    """
+    base = f"https://www.propertyfinder.ae/en/{url_prefix}/apartments-for-{url_word}-in-{community}"
     if page > 1:
         return f"{base}/page-{page}"
     return base
 
 
-def extract_listings_from_next_data(page_content: str, listing_type: str) -> list[dict]:
+def extract_listings_from_next_data(page_content: str, stored_type: str) -> list[dict]:
     """Extract listing data from __NEXT_DATA__ JSON."""
     try:
-        # Find the __NEXT_DATA__ script content
         start = page_content.find('id="__NEXT_DATA__"')
         if start == -1:
             return []
-        # Find the JSON start
         json_start = page_content.find(">", start) + 1
         json_end = page_content.find("</script>", json_start)
         raw_json = page_content[json_start:json_end]
@@ -68,7 +73,6 @@ def extract_listings_from_next_data(page_content: str, listing_type: str) -> lis
 
     listings = []
     try:
-        # Navigate the Next.js data structure
         page_props = data.get("props", {}).get("pageProps", {})
         search_result = page_props.get("searchResult", {})
         properties = search_result.get("properties", [])
@@ -79,7 +83,6 @@ def extract_listings_from_next_data(page_content: str, listing_type: str) -> lis
                 price = prop.get("price", 0)
                 size_sqft = prop.get("area", 0)
                 bedrooms_raw = prop.get("bedrooms", 0)
-                community = prop.get("location", [{}])
                 building = prop.get("buildingName", "") or ""
 
                 # Extract community name from location array
@@ -105,9 +108,6 @@ def extract_listings_from_next_data(page_content: str, listing_type: str) -> lis
                 listing_url = prop.get("url", "")
                 if listing_url and not listing_url.startswith("http"):
                     listing_url = f"https://www.propertyfinder.ae{listing_url}"
-
-                # Map 'buy' back to 'sale' for storage
-                stored_type = "sale" if listing_type == "buy" else "rent"
 
                 listings.append({
                     "reference_no": reference_no,
@@ -148,6 +148,40 @@ def get_total_pages(page_content: str) -> int:
         return 0
 
 
+def pass_waf_challenge(page) -> bool:
+    """Navigate to PF homepage and wait for WAF challenge to resolve."""
+    logger.info("Navigating to PF homepage to pass WAF challenge...")
+    try:
+        page.goto("https://www.propertyfinder.ae/en/", wait_until="domcontentloaded", timeout=30000)
+        # Wait for the challenge to resolve — WAF sets cookies after JS executes
+        time.sleep(10)
+        # Try waiting for any real page content to appear
+        try:
+            page.wait_for_selector('a[href*="propertyfinder"]', timeout=20000)
+            logger.info("WAF challenge passed — homepage loaded")
+            return True
+        except Exception:
+            # Check if __NEXT_DATA__ is present (another sign of success)
+            content = page.content()
+            if "__NEXT_DATA__" in content:
+                logger.info("WAF challenge passed — __NEXT_DATA__ found")
+                return True
+            # Last resort: check page title
+            title = page.title()
+            logger.info(f"Page title after challenge wait: {title}")
+            if "propertyfinder" in title.lower() or "property" in title.lower():
+                logger.info("WAF challenge likely passed based on title")
+                return True
+            logger.warning("WAF challenge may not have been passed")
+            # Log a snippet of the page to diagnose
+            snippet = content[:500]
+            logger.info(f"Page snippet: {snippet}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed during WAF challenge: {e}")
+        return False
+
+
 def run_scraper():
     start_time = datetime.now(timezone.utc)
     logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ===")
@@ -156,18 +190,39 @@ def run_scraper():
     consecutive_failures = 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=USER_AGENT,
+            locale="en-US",
+            timezone_id="Asia/Dubai",
         )
         page = context.new_page()
         stealth_sync(page)
 
+        # Remove webdriver flag
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        """)
+
+        # Step 1: Pass WAF challenge on homepage first
+        waf_passed = pass_waf_challenge(page)
+        if not waf_passed:
+            logger.warning("WAF challenge may not have passed — continuing anyway")
+
+        time.sleep(random.uniform(3, 5))
+
+        # Step 2: Scrape each community
         for community in COMMUNITIES:
-            for listing_type in LISTING_TYPES:
+            for url_prefix, url_word, stored_type in LISTING_TYPES:
                 label = COMMUNITY_LABELS[community]
-                stored_type = "sale" if listing_type == "buy" else "rent"
                 logger.info(f"\n--- Scraping {label} ({stored_type}) ---")
 
                 community_listings = []
@@ -182,26 +237,32 @@ def run_scraper():
                         )
                         break
 
-                    url = build_url(community, listing_type, page_num)
+                    url = build_url(community, url_prefix, url_word, page_num)
                     try:
                         logger.info(f"Page {page_num}: {url}")
-                        page.goto(url, wait_until="networkidle", timeout=30000)
+                        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+                        # Wait for page to fully render
+                        time.sleep(random.uniform(3, 5))
 
                         # Wait for __NEXT_DATA__ to confirm page loaded
                         try:
                             page.wait_for_selector(
-                                'script#__NEXT_DATA__', timeout=15000
+                                'script#__NEXT_DATA__', timeout=20000
                             )
                         except Exception:
+                            # Log what we see for debugging
+                            title = page.title()
                             logger.warning(
                                 f"__NEXT_DATA__ not found on page {page_num} — "
-                                "possible challenge page"
+                                f"title: '{title}' — possible challenge page"
                             )
                             consecutive_failures += 1
                             time.sleep(random.uniform(5, 10))
                             continue
 
                         content = page.content()
+                        consecutive_failures = 0
 
                         # Get total pages on first page
                         if total_pages is None:
@@ -214,14 +275,12 @@ def run_scraper():
                             logger.info(f"Total pages: {total_pages}")
 
                         page_listings = extract_listings_from_next_data(
-                            content, listing_type
+                            content, stored_type
                         )
 
                         if not page_listings:
                             logger.warning(f"0 listings on page {page_num}")
-                            consecutive_failures += 1
                         else:
-                            consecutive_failures = 0
                             community_listings.extend(page_listings)
 
                         # Check if we've reached the last page
@@ -229,7 +288,6 @@ def run_scraper():
                             break
 
                         page_num += 1
-                        # Random delay between pages
                         delay = random.uniform(3, 7)
                         logger.info(f"Waiting {delay:.1f}s before next page...")
                         time.sleep(delay)
