@@ -32,6 +32,9 @@ LISTING_TYPES = [
     ("rent", "rent", "rent"),
 ]
 
+# Max pages per community/type combo (3 pages ≈ 50 listings for testing)
+MAX_PAGES = 3
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -471,7 +474,7 @@ def run_scraper():
                             logger.info(f"Parsed {len(page_listings)} listings from page {page_num}")
 
                         # Check if we've reached the last page
-                        if page_num >= total_pages:
+                        if page_num >= min(total_pages, MAX_PAGES):
                             break
 
                         page_num += 1
