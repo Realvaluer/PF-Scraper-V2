@@ -279,9 +279,10 @@ def pass_waf_challenge(page) -> bool:
         return False
 
 
-def run_scraper():
+def run_scraper(max_pages: int = None):
+    pages = max_pages or MAX_PAGES_PER_TARGET
     start_time = datetime.now(timezone.utc)
-    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ===")
+    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages per target) ===")
 
     all_listings = []
     total_price_changes = 0
@@ -319,7 +320,7 @@ def run_scraper():
             property_type = target["property_type"]
             base_url = target["url"]
 
-            logger.info(f"\n--- {label} (max {MAX_PAGES_PER_TARGET} pages) ---")
+            logger.info(f"\n--- {label} (max {pages} pages) ---")
 
             # Re-warm WAF between targets (not on first one)
             if idx > 0:
@@ -334,7 +335,7 @@ def run_scraper():
             page_num = 1
             failures = 0
 
-            while page_num <= MAX_PAGES_PER_TARGET:
+            while page_num <= pages:
                 if failures >= 3:
                     logger.error(f"3 failures for {label} — moving on")
                     break
@@ -451,4 +452,10 @@ def run_scraper():
 
 
 if __name__ == "__main__":
-    run_scraper()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--backfill":
+        pages = int(sys.argv[2]) if len(sys.argv) > 2 else 25
+        logger.info(f"=== BACKFILL MODE: {pages} pages per target ===")
+        run_scraper(max_pages=pages)
+    else:
+        run_scraper()
