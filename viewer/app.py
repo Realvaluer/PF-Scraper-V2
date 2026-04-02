@@ -79,7 +79,7 @@ def viewer(
         community_options += f'<option value="{c}" {selected}>{c}</option>'
 
     # Bedrooms options
-    bed_values = ["Studio", "1", "2", "3", "4+"]
+    bed_values = ["Studio", "1", "2", "3", "4", "5", "6", "7"]
     bed_options = '<option value="all">All Bedrooms</option>'
     for b in bed_values:
         selected = "selected" if b == bedrooms else ""

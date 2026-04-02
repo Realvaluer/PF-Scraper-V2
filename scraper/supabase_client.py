@@ -32,6 +32,23 @@ def sanitize_listings(listings: list[dict]) -> list[dict]:
     return cleaned
 
 
+def delete_all_listings() -> None:
+    """Delete all existing listings to start fresh."""
+    try:
+        response = httpx.delete(
+            REST_URL,
+            headers=HEADERS,
+            params={"id": "gt.0"},
+            timeout=30,
+        )
+        if response.status_code in (200, 204):
+            logger.info("Deleted all existing listings")
+        else:
+            logger.error(f"Delete failed: {response.status_code} — {response.text[:200]}")
+    except Exception as e:
+        logger.error(f"Delete failed: {e}")
+
+
 def upsert_listings(listings: list[dict]) -> None:
     """Upsert listings into pf_listings_v2 via REST API."""
     if not listings:

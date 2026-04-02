@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from supabase_client import upsert_listings
+from supabase_client import upsert_listings, delete_all_listings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,22 +75,21 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
         logger.info(f"searchResult keys: {list(search_result.keys())}")
         logger.info(f"Found {len(properties)} listings in __NEXT_DATA__")
 
-        # Debug: DUMP first listing's property structure to discover field names
+        # Debug: log first listing's key fields
         if properties:
-            first_wrapper = properties[0]
-            logger.info(f"Wrapper keys: {list(first_wrapper.keys())}")
-            first_prop = first_wrapper.get("property", first_wrapper)
-            logger.info(f"=== FIRST PROPERTY DUMP ===")
-            logger.info(f"Property keys: {list(first_prop.keys())}")
-            for k, v in first_prop.items():
-                v_str = str(v)[:200]
-                logger.info(f"  {k}: {v_str}")
-            logger.info(f"=== END DUMP ===")
+            fp = properties[0].get("property", properties[0])
+            loc = fp.get("location", {})
+            loc_name = loc.get("full_name", "")[:80] if isinstance(loc, dict) else ""
+            logger.info(f"First listing: ref={fp.get('reference')}, beds={fp.get('bedrooms')}, "
+                        f"price={fp.get('price')}, size={fp.get('size')}, location={loc_name}")
 
         for wrapper in properties:
             try:
                 # Real data is inside the "property" sub-object
-                prop = wrapper.get("property", wrapper)
+                prop = wrapper.get("property") or wrapper
+                if not isinstance(prop, dict):
+                    logger.warning("Skipping listing: property is not a dict")
+                    continue
 
                 # reference
                 reference_no = prop.get("reference", "") or str(prop.get("id", ""))
@@ -117,7 +116,7 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 except (ValueError, TypeError):
                     size_sqft = 0
 
-                # bedrooms
+                # bedrooms — show actual number, "Studio" for 0
                 bedrooms_raw = prop.get("bedrooms", 0)
                 try:
                     bed_num = int(bedrooms_raw)
@@ -126,8 +125,6 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
 
                 if bed_num == 0 or str(bedrooms_raw).lower() == "studio":
                     bedrooms = "Studio"
-                elif bed_num >= 4:
-                    bedrooms = "4+"
                 elif bed_num > 0:
                     bedrooms = str(bed_num)
                 else:
@@ -148,19 +145,26 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                     full_name = ", ".join(location_parts)
 
                 # Parse community and building from full_name
-                # PF format: "City, Community, Sub-community/Building"
+                # PF format: "Building, Sub-area, Community, City" (city is LAST)
+                # e.g. "Claren Tower 2, Claren Towers, Downtown Dubai, Dubai"
+                # e.g. "Reef Residence, District 13, Jumeirah Village Circle, Dubai"
+                # e.g. "LIVA, Town Square, Dubai"
+                # e.g. "Business Bay, Dubai"
                 community = ""
                 building = ""
                 if full_name:
                     parts = [p.strip() for p in full_name.split(",")]
                     if len(parts) >= 4:
-                        community = parts[1]
-                        building = parts[-1]
+                        # "Building, Sub, Community, City"
+                        building = parts[0]
+                        community = parts[-2]  # second to last = community
                     elif len(parts) == 3:
+                        # "Building, Community, City"
+                        building = parts[0]
                         community = parts[1]
-                        building = parts[2]
                     elif len(parts) == 2:
-                        community = parts[1]
+                        # "Community, City"
+                        community = parts[0]
                     elif len(parts) == 1:
                         community = parts[0]
 
@@ -169,8 +173,12 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 if listing_url and not listing_url.startswith("http"):
                     listing_url = f"https://www.propertyfinder.ae{listing_url}"
 
-                # Price per sqft
-                price_per_sqft = prop.get("price_per_area", 0) or prop.get("rsp", 0)
+                # Price per sqft — PF stores as {"price": 1578, "unit": "sqft"}
+                ppa_obj = prop.get("price_per_area", {})
+                if isinstance(ppa_obj, dict):
+                    price_per_sqft = ppa_obj.get("price", 0)
+                else:
+                    price_per_sqft = ppa_obj or 0
                 if not price_per_sqft and size_sqft and price:
                     price_per_sqft = round(price / size_sqft, 2)
                 try:
@@ -266,6 +274,10 @@ def pass_waf_challenge(page) -> bool:
 def run_scraper():
     start_time = datetime.now(timezone.utc)
     logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ===")
+
+    # Clear old data before fresh scrape
+    logger.info("Clearing old listings...")
+    delete_all_listings()
 
     all_listings = []
 
