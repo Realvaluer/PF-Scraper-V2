@@ -132,26 +132,39 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 # location — could be dict or list
                 location_obj = prop.get("location", {})
                 full_name = ""
+                location_parts = []  # ordered list of location names
+
                 if isinstance(location_obj, dict):
                     full_name = location_obj.get("full_name", "") or location_obj.get("name", "")
                 elif isinstance(location_obj, list) and location_obj:
-                    # Sometimes location is a list of location parts
-                    full_name = ", ".join(
+                    # Location is a list of dicts: [{name: "Dubai"}, {name: "JVC"}, ...]
+                    location_parts = [
                         loc.get("name", "") or loc.get("full_name", "")
                         for loc in location_obj
-                        if isinstance(loc, dict)
-                    )
+                        if isinstance(loc, dict) and (loc.get("name") or loc.get("full_name"))
+                    ]
+                    full_name = ", ".join(location_parts)
 
                 # Parse community and building from full_name
+                # PF format: "City, Community, Sub-community/Building"
+                # e.g. "Dubai, Jumeirah Village Circle, District 13"
+                # e.g. "Dubai, Downtown Dubai, 29 Burj Boulevard"
+                # e.g. "Dubai, Meydan, Meydan Avenue, The Polo Residence"
                 community = ""
                 building = ""
                 if full_name:
                     parts = [p.strip() for p in full_name.split(",")]
-                    if len(parts) >= 3:
-                        building = parts[0]
-                        community = parts[-2]
+                    # First part is city (Dubai) — skip it
+                    # Second part is community
+                    # Last part (if 3+) is building/sub-community
+                    if len(parts) >= 4:
+                        community = parts[1]       # e.g. "Meydan"
+                        building = parts[-1]        # e.g. "The Polo Residence"
+                    elif len(parts) == 3:
+                        community = parts[1]        # e.g. "Jumeirah Village Circle"
+                        building = parts[2]          # e.g. "District 13"
                     elif len(parts) == 2:
-                        community = parts[0]
+                        community = parts[1]        # e.g. "Town Square"
                     elif len(parts) == 1:
                         community = parts[0]
 
