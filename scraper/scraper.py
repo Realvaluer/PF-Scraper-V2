@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from supabase_client import upsert_listings, fetch_current_prices, log_price_changes
+from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +32,7 @@ SCRAPE_TARGETS = [
     },
 ]
 
-MAX_LISTINGS_PER_TARGET = 50
+MAX_PAGES_PER_TARGET = 5
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -130,6 +130,13 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 else:
                     bedrooms = str(bedrooms_raw)
 
+                # bathrooms
+                bathrooms_raw = prop.get("bathrooms_value", 0) or prop.get("bathrooms", 0)
+                try:
+                    bathrooms = int(bathrooms_raw) if bathrooms_raw else 0
+                except (ValueError, TypeError):
+                    bathrooms = 0
+
                 # location — could be dict or list
                 location_obj = prop.get("location", {})
                 full_name = ""
@@ -198,6 +205,7 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                     "community": community,
                     "building": building,
                     "bedrooms": bedrooms,
+                    "bathrooms": bathrooms,
                     "size_sqft": size_sqft,
                     "price": price,
                     "price_per_sqft": price_per_sqft,
@@ -311,7 +319,7 @@ def run_scraper():
             property_type = target["property_type"]
             base_url = target["url"]
 
-            logger.info(f"\n--- {label} (max {MAX_LISTINGS_PER_TARGET}) ---")
+            logger.info(f"\n--- {label} (max {MAX_PAGES_PER_TARGET} pages) ---")
 
             # Re-warm WAF between targets (not on first one)
             if idx > 0:
@@ -326,7 +334,7 @@ def run_scraper():
             page_num = 1
             failures = 0
 
-            while len(target_listings) < MAX_LISTINGS_PER_TARGET:
+            while page_num <= MAX_PAGES_PER_TARGET:
                 if failures >= 3:
                     logger.error(f"3 failures for {label} — moving on")
                     break
@@ -403,13 +411,17 @@ def run_scraper():
                             log_price_changes(changes)
                             total_price_changes += len(changes)
 
-                        # Upsert after each page
+                        # Add scraped_at timestamp
+                        now = datetime.now(timezone.utc).isoformat()
+                        for l in page_listings:
+                            l["scraped_at"] = now
+
+                        # Upsert to pf_listings_v2
                         logger.info(f"Upserting {len(page_listings)} listings...")
                         upsert_listings(page_listings)
 
-                    if len(target_listings) >= MAX_LISTINGS_PER_TARGET:
-                        target_listings = target_listings[:MAX_LISTINGS_PER_TARGET]
-                        break
+                        # Sync to ddf_listings
+                        sync_to_ddf(page_listings)
 
                     page_num += 1
                     time.sleep(random.uniform(3, 7))
