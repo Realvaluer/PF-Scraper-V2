@@ -120,6 +120,9 @@ def upsert_listings(listings: list[dict]) -> None:
         logger.info("No listings to upsert")
         return
 
+    # Remove fields not in pf_listings_v2 schema
+    PF_EXCLUDE = {"bathrooms", "scraped_at"}
+    listings = [{k: v for k, v in l.items() if k not in PF_EXCLUDE} for l in listings]
     listings = sanitize_listings(listings)
 
     # Deduplicate by (reference_no, listing_type) — keep last occurrence
