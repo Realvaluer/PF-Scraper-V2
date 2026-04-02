@@ -77,21 +77,21 @@ def viewer(
         url = l.get("listing_url") or "#"
         ref = l.get("reference_no", "")
 
-        # Check for price change
-        change_html = ""
+        # Build price change cell
         ph_key = (ref, l.get("listing_type", ""))
+        change_cell = ""
         if ph_key in price_history:
             ph = price_history[ph_key]
             old_p = float(ph.get("old_price", 0))
             new_p = float(ph.get("new_price", 0))
+            changed_date = ph.get("changed_at", "")[:10]
             if old_p > 0 and new_p > 0:
                 diff = new_p - old_p
                 pct = (diff / old_p) * 100
-                changed_date = ph.get("changed_at", "")[:10]
                 if diff < 0:
-                    change_html = f'<span class="price-down" title="Was AED {old_p:,.0f} on {changed_date}">&#9660; {pct:.1f}%</span>'
+                    change_cell = f'<span class="price-down" title="Was AED {old_p:,.0f} on {changed_date}">&#9660; {pct:.1f}%</span>'
                 elif diff > 0:
-                    change_html = f'<span class="price-up" title="Was AED {old_p:,.0f} on {changed_date}">&#9650; +{pct:.1f}%</span>'
+                    change_cell = f'<span class="price-up" title="Was AED {old_p:,.0f} on {changed_date}">&#9650; +{pct:.1f}%</span>'
 
         rows_html += f"""
         <tr>
@@ -99,8 +99,9 @@ def viewer(
             <td>{l.get('building', '')}</td>
             <td>{l.get('bedrooms', '')}</td>
             <td>{size} sqft</td>
-            <td>AED {price} {change_html}</td>
+            <td>AED {price}</td>
             <td>AED {ppsf}/sqft</td>
+            <td>{change_cell or '—'}</td>
             <td>{ltype}</td>
             <td><a href="{url}" target="_blank" rel="noopener">View</a></td>
         </tr>"""
@@ -169,6 +170,7 @@ def viewer(
                 <th>Size</th>
                 <th>Price</th>
                 <th>Price/sqft</th>
+                <th>Price Change</th>
                 <th>Type</th>
                 <th>Listing</th>
             </tr>

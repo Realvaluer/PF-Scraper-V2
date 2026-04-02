@@ -32,7 +32,7 @@ SCRAPE_TARGETS = [
     },
 ]
 
-MAX_LISTINGS_PER_TARGET = 20
+MAX_LISTINGS_PER_TARGET = 50
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
