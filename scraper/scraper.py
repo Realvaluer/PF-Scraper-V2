@@ -59,7 +59,12 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
     listings = []
     try:
         page_props = data.get("props", {}).get("pageProps", {})
+        logger.info(f"pageProps keys: {list(page_props.keys())[:20]}")
         search_result = page_props.get("searchResult", {})
+        if not search_result:
+            # Try alternative paths
+            search_result = page_props.get("search_result", {}) or page_props.get("data", {}) or page_props.get("results", {})
+            logger.info(f"Used fallback searchResult, keys: {list(search_result.keys()) if isinstance(search_result, dict) else 'not a dict'}")
 
         # PF uses "listings" — fallback to "properties"
         properties = search_result.get("listings", [])
@@ -70,21 +75,16 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
         logger.info(f"searchResult keys: {list(search_result.keys())}")
         logger.info(f"Found {len(properties)} listings in __NEXT_DATA__")
 
-        # Debug: log first listing's keys and structure
+        # Debug: DUMP first listing's full structure to discover field names
         if properties:
             first = properties[0]
-            logger.info(f"First listing keys: {list(first.keys())}")
-            # Log key fields to verify structure
-            logger.info(f"  reference: {first.get('reference')}")
-            logger.info(f"  price type: {type(first.get('price'))}, value: {first.get('price')}")
-            logger.info(f"  size type: {type(first.get('size'))}, value: {first.get('size')}")
-            logger.info(f"  location type: {type(first.get('location'))}")
-            if isinstance(first.get('location'), dict):
-                logger.info(f"  location keys: {list(first['location'].keys())}")
-                logger.info(f"  location.full_name: {first['location'].get('full_name')}")
-            logger.info(f"  bedrooms: {first.get('bedrooms')}")
-            logger.info(f"  details_path: {first.get('details_path')}")
-            logger.info(f"  share_url: {first.get('share_url')}")
+            logger.info(f"=== FIRST LISTING FULL DUMP ===")
+            logger.info(f"Keys: {list(first.keys())}")
+            # Log every key-value pair (truncated)
+            for k, v in first.items():
+                v_str = str(v)[:200]
+                logger.info(f"  {k}: {v_str}")
+            logger.info(f"=== END DUMP ===")
 
         for prop in properties:
             try:
@@ -182,10 +182,9 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 except (ValueError, TypeError):
                     price_per_sqft = 0
 
-                # Skip listings with no useful data
+                # Log if listing has no useful data but still include it for debugging
                 if not reference_no and not price and not size_sqft:
-                    logger.warning("Skipping listing with no reference, price, or size")
-                    continue
+                    logger.warning(f"Listing with no ref/price/size — raw keys: {list(prop.keys())[:10]}")
 
                 listings.append({
                     "reference_no": reference_no,
