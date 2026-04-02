@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from supabase_client import upsert_listings, delete_all_listings
+from supabase_client import upsert_listings, fetch_current_prices, log_price_changes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -275,11 +275,8 @@ def run_scraper():
     start_time = datetime.now(timezone.utc)
     logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ===")
 
-    # Clear old data before fresh scrape
-    logger.info("Clearing old listings...")
-    delete_all_listings()
-
     all_listings = []
+    total_price_changes = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -385,6 +382,27 @@ def run_scraper():
                                 f"url={first['listing_url'][:60]}"
                             )
 
+                        # Check for price changes before upserting
+                        ref_nos = [l["reference_no"] for l in page_listings if l["reference_no"]]
+                        current_prices = fetch_current_prices(ref_nos, stored_type)
+
+                        changes = []
+                        for l in page_listings:
+                            ref = l["reference_no"]
+                            if ref in current_prices and current_prices[ref] != l["price"] and current_prices[ref] > 0 and l["price"] > 0:
+                                changes.append({
+                                    "reference_no": ref,
+                                    "listing_type": stored_type,
+                                    "old_price": current_prices[ref],
+                                    "new_price": l["price"],
+                                })
+                                logger.info(f"Price change: {ref} — AED {current_prices[ref]:,.0f} → AED {l['price']:,.0f}")
+
+                        if changes:
+                            logger.info(f"Detected {len(changes)} price changes!")
+                            log_price_changes(changes)
+                            total_price_changes += len(changes)
+
                         # Upsert after each page
                         logger.info(f"Upserting {len(page_listings)} listings...")
                         upsert_listings(page_listings)
@@ -415,7 +433,8 @@ def run_scraper():
         f"Start:    {start_time.isoformat()}\n"
         f"End:      {end_time.isoformat()}\n"
         f"Duration: {duration:.0f}s\n"
-        f"Total listings scraped: {len(all_listings)}"
+        f"Total listings scraped: {len(all_listings)}\n"
+        f"Price changes detected: {total_price_changes}"
     )
 
 

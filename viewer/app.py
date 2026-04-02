@@ -26,7 +26,7 @@ def viewer(
     bedrooms: str = Query(default="all"),
     listing_type: str = Query(default="all"),
 ):
-    # Fetch data
+    # Fetch listings
     query = supabase.table("pf_listings_v2").select("*").order("price", desc=False)
     if community != "all":
         query = query.eq("community", community)
@@ -37,6 +37,17 @@ def viewer(
 
     result = query.limit(5000).execute()
     listings = result.data or []
+
+    # Fetch price history — get most recent change per listing
+    price_history = {}
+    try:
+        ph_result = supabase.table("pf_price_history").select("*").order("changed_at", desc=True).limit(1000).execute()
+        for ph in (ph_result.data or []):
+            key = (ph.get("reference_no", ""), ph.get("listing_type", ""))
+            if key not in price_history:
+                price_history[key] = ph
+    except Exception:
+        pass  # Table may not exist yet
 
     # Get distinct communities and last scraped time
     all_data = supabase.table("pf_listings_v2").select("community,scraped_at").execute()
@@ -52,21 +63,43 @@ def viewer(
     count_result = supabase.table("pf_listings_v2").select("id", count="exact").execute()
     total_count = count_result.count or 0
 
+    # Count price changes
+    price_change_count = len(price_history)
+
     # Build table rows
     rows_html = ""
     for l in listings:
         size = format_number(l.get("size_sqft"))
-        price = format_number(l.get("price"))
+        price_val = l.get("price", 0) or 0
+        price = format_number(price_val)
         ppsf = format_number(l.get("price_per_sqft"))
         ltype = (l.get("listing_type") or "").capitalize()
         url = l.get("listing_url") or "#"
+        ref = l.get("reference_no", "")
+
+        # Check for price change
+        change_html = ""
+        ph_key = (ref, l.get("listing_type", ""))
+        if ph_key in price_history:
+            ph = price_history[ph_key]
+            old_p = float(ph.get("old_price", 0))
+            new_p = float(ph.get("new_price", 0))
+            if old_p > 0 and new_p > 0:
+                diff = new_p - old_p
+                pct = (diff / old_p) * 100
+                changed_date = ph.get("changed_at", "")[:10]
+                if diff < 0:
+                    change_html = f'<span class="price-down" title="Was AED {old_p:,.0f} on {changed_date}">&#9660; {pct:.1f}%</span>'
+                elif diff > 0:
+                    change_html = f'<span class="price-up" title="Was AED {old_p:,.0f} on {changed_date}">&#9650; +{pct:.1f}%</span>'
+
         rows_html += f"""
         <tr>
             <td>{l.get('community', '')}</td>
             <td>{l.get('building', '')}</td>
             <td>{l.get('bedrooms', '')}</td>
             <td>{size} sqft</td>
-            <td>AED {price}</td>
+            <td>AED {price} {change_html}</td>
             <td>AED {ppsf}/sqft</td>
             <td>{ltype}</td>
             <td><a href="{url}" target="_blank" rel="noopener">View</a></td>
@@ -111,11 +144,13 @@ def viewer(
         tr:hover {{ background: #fafafa; }}
         a {{ color: #2563eb; text-decoration: none; }}
         a:hover {{ text-decoration: underline; }}
+        .price-down {{ color: #16a34a; font-size: 0.75rem; font-weight: 600; margin-left: 4px; cursor: help; }}
+        .price-up {{ color: #dc2626; font-size: 0.75rem; font-weight: 600; margin-left: 4px; cursor: help; }}
     </style>
 </head>
 <body>
     <h1>PF Scraper V2 — Listings Viewer</h1>
-    <p class="meta">Total listings: {total_count} &nbsp;|&nbsp; Last scraped: {last_scraped or 'N/A'}</p>
+    <p class="meta">Total listings: {total_count} &nbsp;|&nbsp; Price changes tracked: {price_change_count} &nbsp;|&nbsp; Last scraped: {last_scraped or 'N/A'}</p>
 
     <form class="filters" method="get" action="/">
         <select name="community" onchange="this.form.submit()">{community_options}</select>

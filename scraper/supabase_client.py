@@ -10,11 +10,28 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].strip()
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"].strip()
 
 REST_URL = f"{SUPABASE_URL}/rest/v1/pf_listings_v2"
+PRICE_HISTORY_URL = f"{SUPABASE_URL}/rest/v1/pf_price_history"
+
 HEADERS = {
     "apikey": SUPABASE_SERVICE_KEY,
     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates",
+}
+
+# Read-only headers (no Prefer needed for GET)
+READ_HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json",
+}
+
+# Insert-only headers (no merge-duplicates needed for price history)
+INSERT_HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal",
 }
 
 
@@ -32,21 +49,60 @@ def sanitize_listings(listings: list[dict]) -> list[dict]:
     return cleaned
 
 
-def delete_all_listings() -> None:
-    """Delete all existing listings to start fresh."""
+def fetch_current_prices(reference_nos: list[str], listing_type: str) -> dict[str, float]:
+    """Fetch current prices for given reference numbers from Supabase.
+    Returns dict mapping reference_no -> current price."""
+    if not reference_nos:
+        return {}
+
+    prices = {}
     try:
-        response = httpx.delete(
+        # Build comma-separated list for PostgREST in filter
+        refs_csv = ",".join(f'"{r}"' for r in reference_nos)
+        response = httpx.get(
             REST_URL,
-            headers=HEADERS,
-            params={"id": "gt.0"},
-            timeout=30,
+            headers=READ_HEADERS,
+            params={
+                "select": "reference_no,price",
+                "listing_type": f"eq.{listing_type}",
+                "reference_no": f"in.({refs_csv})",
+            },
+            timeout=15,
         )
-        if response.status_code in (200, 204):
-            logger.info("Deleted all existing listings")
+        if response.status_code == 200:
+            rows = response.json()
+            for row in rows:
+                ref = row.get("reference_no", "")
+                price = row.get("price", 0)
+                if ref and price:
+                    prices[ref] = float(price)
+            logger.info(f"Fetched {len(prices)} existing prices for comparison")
         else:
-            logger.error(f"Delete failed: {response.status_code} — {response.text[:200]}")
+            logger.warning(f"Failed to fetch prices: {response.status_code} — {response.text[:200]}")
     except Exception as e:
-        logger.error(f"Delete failed: {e}")
+        logger.warning(f"Failed to fetch prices: {e}")
+
+    return prices
+
+
+def log_price_changes(changes: list[dict]) -> None:
+    """Insert price change records into pf_price_history."""
+    if not changes:
+        return
+
+    try:
+        response = httpx.post(
+            PRICE_HISTORY_URL,
+            headers=INSERT_HEADERS,
+            json=changes,
+            timeout=15,
+        )
+        if response.status_code in (200, 201):
+            logger.info(f"Logged {len(changes)} price changes to history")
+        else:
+            logger.error(f"Price history insert failed: {response.status_code} — {response.text[:200]}")
+    except Exception as e:
+        logger.error(f"Price history insert failed: {e}")
 
 
 def upsert_listings(listings: list[dict]) -> None:
