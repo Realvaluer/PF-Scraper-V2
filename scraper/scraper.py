@@ -33,6 +33,7 @@ SCRAPE_TARGETS = [
 ]
 
 MAX_PAGES_PER_TARGET = 5
+BACKFILL_DEFAULT_PAGES = 50
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -454,7 +455,7 @@ def run_scraper(max_pages: int = None):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--backfill":
-        pages = int(sys.argv[2]) if len(sys.argv) > 2 else 25
+        pages = int(sys.argv[2]) if len(sys.argv) > 2 else BACKFILL_DEFAULT_PAGES
         logger.info(f"=== BACKFILL MODE: {pages} pages per target ===")
         run_scraper(max_pages=pages)
     else:
