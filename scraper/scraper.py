@@ -75,23 +75,27 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
         logger.info(f"searchResult keys: {list(search_result.keys())}")
         logger.info(f"Found {len(properties)} listings in __NEXT_DATA__")
 
-        # Debug: DUMP first listing's full structure to discover field names
+        # Debug: DUMP first listing's property structure to discover field names
         if properties:
-            first = properties[0]
-            logger.info(f"=== FIRST LISTING FULL DUMP ===")
-            logger.info(f"Keys: {list(first.keys())}")
-            # Log every key-value pair (truncated)
-            for k, v in first.items():
+            first_wrapper = properties[0]
+            logger.info(f"Wrapper keys: {list(first_wrapper.keys())}")
+            first_prop = first_wrapper.get("property", first_wrapper)
+            logger.info(f"=== FIRST PROPERTY DUMP ===")
+            logger.info(f"Property keys: {list(first_prop.keys())}")
+            for k, v in first_prop.items():
                 v_str = str(v)[:200]
                 logger.info(f"  {k}: {v_str}")
             logger.info(f"=== END DUMP ===")
 
-        for prop in properties:
+        for wrapper in properties:
             try:
-                # reference (string like "AP743512-3")
+                # Real data is inside the "property" sub-object
+                prop = wrapper.get("property", wrapper)
+
+                # reference
                 reference_no = prop.get("reference", "") or str(prop.get("id", ""))
 
-                # price — could be {"value": 2800000, "currency": "AED"} or just a number
+                # price — could be {"value": X} or just a number
                 price_obj = prop.get("price", {})
                 if isinstance(price_obj, dict):
                     price = price_obj.get("value", 0) or price_obj.get("amount", 0)
@@ -102,7 +106,7 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 except (ValueError, TypeError):
                     price = 0
 
-                # size — could be {"value": 1774, "unit": "sqft"} or just a number
+                # size — could be {"value": X} or just a number
                 size_obj = prop.get("size", {}) or prop.get("area", {})
                 if isinstance(size_obj, dict):
                     size_sqft = size_obj.get("value", 0) or size_obj.get("sqft", 0)
@@ -113,7 +117,7 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 except (ValueError, TypeError):
                     size_sqft = 0
 
-                # bedrooms (int)
+                # bedrooms
                 bedrooms_raw = prop.get("bedrooms", 0)
                 try:
                     bed_num = int(bedrooms_raw)
@@ -132,12 +136,10 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 # location — could be dict or list
                 location_obj = prop.get("location", {})
                 full_name = ""
-                location_parts = []  # ordered list of location names
 
                 if isinstance(location_obj, dict):
                     full_name = location_obj.get("full_name", "") or location_obj.get("name", "")
                 elif isinstance(location_obj, list) and location_obj:
-                    # Location is a list of dicts: [{name: "Dubai"}, {name: "JVC"}, ...]
                     location_parts = [
                         loc.get("name", "") or loc.get("full_name", "")
                         for loc in location_obj
@@ -147,28 +149,22 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
 
                 # Parse community and building from full_name
                 # PF format: "City, Community, Sub-community/Building"
-                # e.g. "Dubai, Jumeirah Village Circle, District 13"
-                # e.g. "Dubai, Downtown Dubai, 29 Burj Boulevard"
-                # e.g. "Dubai, Meydan, Meydan Avenue, The Polo Residence"
                 community = ""
                 building = ""
                 if full_name:
                     parts = [p.strip() for p in full_name.split(",")]
-                    # First part is city (Dubai) — skip it
-                    # Second part is community
-                    # Last part (if 3+) is building/sub-community
                     if len(parts) >= 4:
-                        community = parts[1]       # e.g. "Meydan"
-                        building = parts[-1]        # e.g. "The Polo Residence"
+                        community = parts[1]
+                        building = parts[-1]
                     elif len(parts) == 3:
-                        community = parts[1]        # e.g. "Jumeirah Village Circle"
-                        building = parts[2]          # e.g. "District 13"
+                        community = parts[1]
+                        building = parts[2]
                     elif len(parts) == 2:
-                        community = parts[1]        # e.g. "Town Square"
+                        community = parts[1]
                     elif len(parts) == 1:
                         community = parts[0]
 
-                # URL from details_path or share_url
+                # URL
                 listing_url = prop.get("details_path", "") or prop.get("share_url", "") or prop.get("url", "")
                 if listing_url and not listing_url.startswith("http"):
                     listing_url = f"https://www.propertyfinder.ae{listing_url}"
@@ -182,9 +178,10 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 except (ValueError, TypeError):
                     price_per_sqft = 0
 
-                # Log if listing has no useful data but still include it for debugging
+                # Skip listings with no useful data
                 if not reference_no and not price and not size_sqft:
-                    logger.warning(f"Listing with no ref/price/size — raw keys: {list(prop.keys())[:10]}")
+                    logger.warning(f"Skipping empty listing")
+                    continue
 
                 listings.append({
                     "reference_no": reference_no,
