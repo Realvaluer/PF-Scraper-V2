@@ -599,6 +599,10 @@ if __name__ == "__main__":
         targets = BACKFILL_BATCHES[batch]
         logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, 249 pages each ===")
         run_scraper(max_pages=249, custom_targets=targets)
+        logger.info("=== Backfill done. Running reset-txns and cleanup-duplicates ===")
+        reset_txns()
+        backfill_txns()
+        cleanup_duplicates()
     elif args and args[0] == "--backfill":
         pages = int(args[1]) if len(args) > 1 else BACKFILL_DEFAULT_PAGES
         logger.info(f"=== BACKFILL MODE: {pages} pages per target ===")
