@@ -593,12 +593,13 @@ if __name__ == "__main__":
 
     if args and args[0] == "--backfill-full":
         batch = args[1] if len(args) > 1 else "all"
+        max_pg = int(args[2]) if len(args) > 2 else 249
         if batch not in BACKFILL_BATCHES:
             logger.error(f"Invalid batch: {batch}. Use 1, 2, 3, or all")
             sys.exit(1)
         targets = BACKFILL_BATCHES[batch]
-        logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, 249 pages each ===")
-        run_scraper(max_pages=249, custom_targets=targets)
+        logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, {max_pg} pages each ===")
+        run_scraper(max_pages=max_pg, custom_targets=targets)
         logger.info("=== Backfill done. Running reset-txns and cleanup-duplicates ===")
         reset_txns()
         backfill_txns()
