@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf
+from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows
 
 logging.basicConfig(
     level=logging.INFO,
@@ -286,6 +286,7 @@ def run_scraper(max_pages: int = None):
     logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages per target) ===")
 
     all_listings = []
+    all_new_ddf_ids = []
     total_price_changes = 0
 
     with sync_playwright() as p:
@@ -423,7 +424,8 @@ def run_scraper(max_pages: int = None):
                         upsert_listings(page_listings)
 
                         # Sync to ddf_listings
-                        sync_to_ddf(page_listings)
+                        new_ids = sync_to_ddf(page_listings)
+                        all_new_ddf_ids.extend(new_ids)
 
                     page_num += 1
                     time.sleep(random.uniform(3, 7))
@@ -440,6 +442,9 @@ def run_scraper(max_pages: int = None):
 
         browser.close()
 
+    # Compute dips for all newly inserted DDF rows
+    total_dips = compute_dips_for_rows(all_new_ddf_ids)
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.info(
@@ -448,6 +453,8 @@ def run_scraper(max_pages: int = None):
         f"End:      {end_time.isoformat()}\n"
         f"Duration: {duration:.0f}s\n"
         f"Total listings scraped: {len(all_listings)}\n"
+        f"New DDF rows: {len(all_new_ddf_ids)}\n"
+        f"Dips computed: {total_dips}\n"
         f"Price changes detected: {total_price_changes}"
     )
 

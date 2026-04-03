@@ -36,12 +36,20 @@ INSERT_HEADERS = {
     "Prefer": "return=minimal",
 }
 
-# DDF insert headers — ON CONFLICT (dup_hash) DO NOTHING
+# DDF insert headers — ON CONFLICT (dup_hash) DO NOTHING, return inserted rows
 DDF_INSERT_HEADERS = {
     "apikey": SUPABASE_SERVICE_KEY,
     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "resolution=ignore-duplicates,return=minimal",
+    "Prefer": "resolution=ignore-duplicates,return=representation",
+}
+
+# DDF update headers
+DDF_UPDATE_HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal",
 }
 
 
@@ -205,10 +213,10 @@ def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, float]:
     return prices
 
 
-def sync_to_ddf(listings: list[dict]) -> None:
-    """Map PF listings to ddf_listings schema and insert."""
+def sync_to_ddf(listings: list[dict]) -> list[int]:
+    """Map PF listings to ddf_listings schema and insert. Returns IDs of newly inserted rows."""
     if not listings:
-        return
+        return []
 
     source = "Property Finder"
     city = "Dubai"
@@ -248,7 +256,7 @@ def sync_to_ddf(listings: list[dict]) -> None:
             "type": prop_type,
             "community": l.get("community", ""),
             "property_name": l.get("building", ""),
-            "bedrooms": l.get("bedrooms", ""),
+            "bedrooms": "0" if l.get("bedrooms") == "Studio" else l.get("bedrooms", ""),
             "bathrooms": l.get("bathrooms") or None,
             "size_sqft": int(l.get("size_sqft", 0) or 0),
             "price_aed": price_aed,
@@ -264,8 +272,8 @@ def sync_to_ddf(listings: list[dict]) -> None:
 
     ddf_rows = sanitize_listings(ddf_rows)
 
-    # Insert with ON CONFLICT (dup_hash) DO NOTHING
-    total_inserted = 0
+    # Insert with ON CONFLICT (dup_hash) DO NOTHING — return inserted rows
+    inserted_ids = []
     for i in range(0, len(ddf_rows), 50):
         batch = ddf_rows[i : i + 50]
         try:
@@ -277,11 +285,125 @@ def sync_to_ddf(listings: list[dict]) -> None:
                 timeout=30,
             )
             if response.status_code in (200, 201):
-                total_inserted += len(batch)
-                logger.info(f"DDF batch {i // 50 + 1}: inserted {len(batch)} rows")
+                rows = response.json() if response.text else []
+                ids = [r["id"] for r in rows if "id" in r]
+                inserted_ids.extend(ids)
+                logger.info(f"DDF batch {i // 50 + 1}: inserted {len(ids)} new rows (sent {len(batch)})")
             else:
                 logger.error(f"DDF batch {i // 50 + 1} failed: {response.status_code} — {response.text[:200]}")
         except Exception as e:
             logger.error(f"DDF batch {i // 50 + 1} failed: {e}")
 
-    logger.info(f"DDF sync: {total_inserted} rows sent ({len(ddf_rows)} total, duplicates skipped by dup_hash)")
+    logger.info(f"DDF sync: {len(inserted_ids)} new rows inserted ({len(ddf_rows)} sent, rest skipped by dup_hash)")
+    return inserted_ids
+
+
+# ── Dip Computation ───────────────────────────────────────────────────────────
+
+
+def compute_dip_for_row(row_id: int) -> bool:
+    """Compute dip values for a single DDF listing by finding best matching prior listing."""
+    try:
+        # Fetch the row
+        resp = httpx.get(
+            DDF_URL,
+            headers=READ_HEADERS,
+            params={"select": "*", "id": f"eq.{row_id}"},
+            timeout=15,
+        )
+        if resp.status_code != 200 or not resp.json():
+            return False
+        row = resp.json()[0]
+
+        building = row.get("property_name")
+        purpose = row.get("purpose")
+        bedrooms = row.get("bedrooms")
+        size = row.get("size_sqft")
+        furnished = row.get("furnished")
+        price = row.get("price_aed")
+        date_listed = row.get("date_listed")
+
+        if not building or not price or bedrooms is None or not date_listed:
+            return False
+
+        # Find matching prior listings
+        params = {
+            "select": "id,price_aed,date_listed,url,source,size_sqft,furnished,property_name",
+            "property_name": f"eq.{building}",
+            "purpose": f"eq.{purpose}",
+            "bedrooms": f"eq.{bedrooms}",
+            "date_listed": f"lt.{date_listed}",
+            "price_aed": "gt.0",
+            "order": "date_listed.desc",
+            "limit": "50",
+        }
+        if furnished:
+            params["furnished"] = f"eq.{furnished}"
+
+        resp2 = httpx.get(DDF_URL, headers=READ_HEADERS, params=params, timeout=15)
+        if resp2.status_code != 200:
+            return False
+        matches = resp2.json() or []
+
+        # Filter by size ±10%
+        if size and int(size) > 0:
+            lo = int(size) * 0.9
+            hi = int(size) * 1.1
+            size_matches = [m for m in matches if m.get("size_sqft") and lo <= int(m["size_sqft"]) <= hi]
+            if size_matches:
+                matches = size_matches
+            else:
+                matches = [m for m in matches if not m.get("size_sqft")]
+
+        if not matches:
+            return False
+
+        prev = matches[0]  # Most recent prior listing
+        prev_price = prev.get("price_aed")
+        if not prev_price:
+            return False
+
+        dip_pct = round(((price - prev_price) / prev_price) * 100, 1)
+        dip_price = price - prev_price
+
+        # Update the row with dip data
+        update_resp = httpx.patch(
+            DDF_URL,
+            headers=DDF_UPDATE_HEADERS,
+            params={"id": f"eq.{row_id}"},
+            json={
+                "dip_pct": dip_pct,
+                "dip_price": dip_price,
+                "dip_ref_id": prev["id"],
+                "dip_prev_price": prev_price,
+                "dip_prev_url": prev.get("url"),
+                "dip_prev_source": prev.get("source"),
+                "dip_prev_date": prev.get("date_listed"),
+                "dip_prev_size": prev.get("size_sqft"),
+                "dip_prev_furnished": prev.get("furnished"),
+            },
+            timeout=15,
+        )
+        if update_resp.status_code in (200, 204):
+            logger.info(f"Dip computed for row {row_id}: {dip_pct}% (AED {dip_price:,})")
+            return True
+        else:
+            logger.warning(f"Dip update failed for row {row_id}: {update_resp.status_code}")
+            return False
+
+    except Exception as e:
+        logger.warning(f"Dip computation failed for row {row_id}: {e}")
+        return False
+
+
+def compute_dips_for_rows(row_ids: list[int]) -> int:
+    """Compute dips for a list of newly inserted DDF row IDs."""
+    if not row_ids:
+        return 0
+    logger.info(f"Computing dips for {len(row_ids)} new rows...")
+    computed = 0
+    for row_id in row_ids:
+        if compute_dip_for_row(row_id):
+            computed += 1
+    logger.info(f"Dips computed: {computed}/{len(row_ids)}")
+    return computed
