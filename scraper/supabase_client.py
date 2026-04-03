@@ -766,8 +766,10 @@ def _search_rv_transactions(rv_url: str, building: str, bed_int: int) -> list[di
     """Search RV for matching transactions using multi-strategy approach."""
     select = "id,price,date,size_sqft,community_name,property_name,bedrooms"
 
-    # Only match actual sales/rentals, not mortgage registrations etc.
-    subtype_filter = "in.(Sale,Pre-Registration,Delayed Sale)"
+    # Only match actual sales (not mortgage) / new rentals (not renewals)
+    is_sales = rv_url == RV_SALES_URL
+    type_filter_key = "subtype" if is_sales else "rent_type_name"
+    type_filter_val = "in.(Sale,Pre-Registration,Delayed Sale)" if is_sales else "eq.New"
 
     # Strategy 1: full building name (case-insensitive)
     try:
@@ -777,7 +779,7 @@ def _search_rv_transactions(rv_url: str, building: str, bed_int: int) -> list[di
             "bedrooms": f"eq.{bed_int}",
             "is_valid": "eq.true",
             "price": "gt.0",
-            "subtype": subtype_filter,
+            type_filter_key: type_filter_val,
             "order": "date.desc",
             "limit": "20",
         }, timeout=15)
@@ -799,7 +801,7 @@ def _search_rv_transactions(rv_url: str, building: str, bed_int: int) -> list[di
                 "bedrooms": f"eq.{bed_int}",
                 "is_valid": "eq.true",
                 "price": "gt.0",
-                "subtype": subtype_filter,
+                type_filter_key: type_filter_val,
                 "order": "date.desc",
                 "limit": "30",
             }, timeout=15)
