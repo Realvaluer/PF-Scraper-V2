@@ -213,6 +213,64 @@ def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, float]:
     return prices
 
 
+def invalidate_old_ddf_rows(new_row_ids: list[int]) -> int:
+    """For each newly inserted row, mark older rows with same reference_no + purpose as is_valid=false."""
+    if not new_row_ids:
+        return 0
+
+    invalidated = 0
+
+    # Fetch the new rows to get their reference_no + purpose
+    for i in range(0, len(new_row_ids), 50):
+        batch_ids = new_row_ids[i : i + 50]
+        ids_csv = ",".join(str(rid) for rid in batch_ids)
+        try:
+            resp = httpx.get(
+                DDF_URL,
+                headers=READ_HEADERS,
+                params={
+                    "select": "id,reference_no,purpose",
+                    "id": f"in.({ids_csv})",
+                },
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch new rows for invalidation: {resp.status_code}")
+                continue
+
+            for row in resp.json():
+                ref = row.get("reference_no")
+                purpose = row.get("purpose")
+                new_id = row.get("id")
+                if not ref or not purpose:
+                    continue
+
+                # Mark all older rows for this ref+purpose as is_valid=false
+                patch_resp = httpx.patch(
+                    DDF_URL,
+                    headers=DDF_UPDATE_HEADERS,
+                    params={
+                        "reference_no": f"eq.{ref}",
+                        "purpose": f"eq.{purpose}",
+                        "source": "eq.Property Finder",
+                        "id": f"neq.{new_id}",
+                        "is_valid": "eq.true",
+                    },
+                    json={"is_valid": False},
+                    timeout=15,
+                )
+                if patch_resp.status_code in (200, 204):
+                    invalidated += 1
+                else:
+                    logger.warning(f"Failed to invalidate old rows for {ref}: {patch_resp.status_code}")
+
+        except Exception as e:
+            logger.warning(f"Invalidation batch failed: {e}")
+
+    logger.info(f"Invalidated old rows for {invalidated} listings")
+    return invalidated
+
+
 def sync_to_ddf(listings: list[dict]) -> list[int]:
     """Map PF listings to ddf_listings schema and insert. Returns IDs of newly inserted rows."""
     if not listings:
@@ -295,6 +353,11 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
             logger.error(f"DDF batch {i // 50 + 1} failed: {e}")
 
     logger.info(f"DDF sync: {len(inserted_ids)} new rows inserted ({len(ddf_rows)} sent, rest skipped by dup_hash)")
+
+    # Mark older rows for the same reference_no + purpose as is_valid = false
+    if inserted_ids:
+        invalidate_old_ddf_rows(inserted_ids)
+
     return inserted_ids
 
 
@@ -406,4 +469,54 @@ def compute_dips_for_rows(row_ids: list[int]) -> int:
         if compute_dip_for_row(row_id):
             computed += 1
     logger.info(f"Dips computed: {computed}/{len(row_ids)}")
+    return computed
+
+
+def backfill_dips() -> int:
+    """Backfill dip computation for all Property Finder DDF rows with dip_pct IS NULL."""
+    logger.info("=== Backfilling dips for all PF rows with NULL dip_pct ===")
+
+    # Fetch all PF rows missing dip_pct
+    all_ids = []
+    offset = 0
+    batch_size = 1000
+
+    while True:
+        try:
+            resp = httpx.get(
+                DDF_URL,
+                headers=READ_HEADERS,
+                params={
+                    "select": "id",
+                    "source": "eq.Property Finder",
+                    "dip_pct": "is.null",
+                    "order": "id.asc",
+                    "limit": str(batch_size),
+                    "offset": str(offset),
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch rows: {resp.status_code} — {resp.text[:200]}")
+                break
+            rows = resp.json()
+            if not rows:
+                break
+            all_ids.extend(r["id"] for r in rows)
+            offset += batch_size
+            logger.info(f"Fetched {len(all_ids)} row IDs so far...")
+        except Exception as e:
+            logger.error(f"Failed to fetch rows: {e}")
+            break
+
+    logger.info(f"Total rows to backfill: {len(all_ids)}")
+
+    computed = 0
+    for i, row_id in enumerate(all_ids):
+        if compute_dip_for_row(row_id):
+            computed += 1
+        if (i + 1) % 100 == 0:
+            logger.info(f"Progress: {i + 1}/{len(all_ids)} processed, {computed} dips computed")
+
+    logger.info(f"=== Backfill complete: {computed}/{len(all_ids)} dips computed ===")
     return computed

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows
+from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips
 
 logging.basicConfig(
     level=logging.INFO,
@@ -465,5 +465,7 @@ if __name__ == "__main__":
         pages = int(sys.argv[2]) if len(sys.argv) > 2 else BACKFILL_DEFAULT_PAGES
         logger.info(f"=== BACKFILL MODE: {pages} pages per target ===")
         run_scraper(max_pages=pages)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-dips":
+        backfill_dips()
     else:
         run_scraper()
