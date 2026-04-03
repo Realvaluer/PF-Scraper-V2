@@ -10,9 +10,15 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = os.environ["SUPABASE_URL"].strip()
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"].strip()
 
+# RealValuer Supabase (rv_sales, rv_rentals)
+RV_SUPABASE_URL = os.environ.get("RV_SUPABASE_URL", "https://jbqxxaxesaqymqgtmkvu.supabase.co").strip()
+RV_SUPABASE_KEY = os.environ.get("RV_SUPABASE_KEY", "").strip()
+
 REST_URL = f"{SUPABASE_URL}/rest/v1/pf_listings_v2"
 PRICE_HISTORY_URL = f"{SUPABASE_URL}/rest/v1/pf_price_history"
 DDF_URL = f"{SUPABASE_URL}/rest/v1/ddf_listings"
+RV_SALES_URL = f"{RV_SUPABASE_URL}/rest/v1/rv_sales"
+RV_RENTALS_URL = f"{RV_SUPABASE_URL}/rest/v1/rv_rentals"
 
 HEADERS = {
     "apikey": SUPABASE_SERVICE_KEY,
@@ -51,6 +57,13 @@ DDF_UPDATE_HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=minimal",
 }
+
+# RealValuer read headers
+RV_READ_HEADERS = {
+    "apikey": RV_SUPABASE_KEY,
+    "Authorization": f"Bearer {RV_SUPABASE_KEY}",
+    "Content-Type": "application/json",
+} if RV_SUPABASE_KEY else {}
 
 
 def sanitize_listings(listings: list[dict]) -> list[dict]:
@@ -519,4 +532,284 @@ def backfill_dips() -> int:
             logger.info(f"Progress: {i + 1}/{len(all_ids)} processed, {computed} dips computed")
 
     logger.info(f"=== Backfill complete: {computed}/{len(all_ids)} dips computed ===")
+    return computed
+
+
+# ── Transaction Comparison (Listing vs DLD) ──────────────────────────────────
+
+
+STOP_WORDS = {"dubai", "the", "al", "el", "de", "at", "in", "on", "by"}
+
+
+def _normalize_building_name(s: str) -> str:
+    """Normalize building name for comparison."""
+    s = s.lower().strip()
+    s = re.sub(r'\btowers?\b', 'tower', s)
+    s = re.sub(r'\bresidences?\b', 'residence', s)
+    s = re.sub(r'\bbuildings?\b', '', s)
+    s = re.sub(r'\bhouses?\b', 'house', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def _building_fuzzy_match(pf_name: str, rv_name: str) -> bool:
+    """Fuzzy match two building names."""
+    a = _normalize_building_name(pf_name)
+    b = _normalize_building_name(rv_name)
+    if a == b:
+        return True
+    if a in b or b in a:
+        return True
+    # Compare significant words
+    wa = set(a.split())
+    wb = set(b.split())
+    if not wa or not wb:
+        return False
+    overlap = wa & wb
+    smaller = min(len(wa), len(wb))
+    return len(overlap) >= max(2, smaller * 0.7)
+
+
+def _community_fuzzy_match(community_a: str, community_b: str) -> bool:
+    """Fuzzy match two community names. Returns True if they likely refer to the same place."""
+    if not community_a or not community_b:
+        return True  # If either is missing, don't filter on community
+
+    # Normalize compound words
+    def expand(s):
+        s = s.lower().strip()
+        s = re.sub(r'motorcity', 'motor city', s)
+        s = re.sub(r'businessbay', 'business bay', s)
+        return s
+
+    a = expand(community_a)
+    b = expand(community_b)
+
+    # Exact match
+    if a == b:
+        return True
+
+    # One contains the other
+    if a in b or b in a:
+        return True
+
+    # Compare significant words (drop stop words)
+    words_a = {w for w in a.replace("-", " ").split() if w not in STOP_WORDS and len(w) > 1}
+    words_b = {w for w in b.replace("-", " ").split() if w not in STOP_WORDS and len(w) > 1}
+
+    if not words_a or not words_b:
+        return True
+
+    # If majority of words overlap
+    overlap = words_a & words_b
+    smaller = min(len(words_a), len(words_b))
+    return len(overlap) >= max(1, smaller * 0.5)
+
+
+def _search_rv_transactions(rv_url: str, building: str, bed_int: int) -> list[dict]:
+    """Search RV for matching transactions using multi-strategy approach."""
+    select = "id,price,date,size_sqft,community_name,property_name,bedrooms"
+
+    # Strategy 1: full building name (case-insensitive)
+    try:
+        resp = httpx.get(rv_url, headers=RV_READ_HEADERS, params={
+            "select": select,
+            "property_name": f"ilike.%{building}%",
+            "bedrooms": f"eq.{bed_int}",
+            "is_valid": "eq.true",
+            "price": "gt.0",
+            "order": "date.desc",
+            "limit": "20",
+        }, timeout=15)
+        if resp.status_code == 200 and resp.json():
+            return resp.json()
+    except Exception:
+        pass
+
+    # Strategy 2: progressively shorter name (3 words, 2 words, 1 word)
+    words = building.split()
+    for n_words in range(min(3, len(words)), 0, -1):
+        search = " ".join(words[:n_words])
+        if len(search) < 3:
+            continue
+        try:
+            resp = httpx.get(rv_url, headers=RV_READ_HEADERS, params={
+                "select": select,
+                "property_name": f"ilike.%{search}%",
+                "bedrooms": f"eq.{bed_int}",
+                "is_valid": "eq.true",
+                "price": "gt.0",
+                "order": "date.desc",
+                "limit": "30",
+            }, timeout=15)
+            if resp.status_code == 200 and resp.json():
+                return resp.json()
+        except Exception:
+            pass
+
+    return []
+
+
+def compute_txn_for_row(row_id: int) -> bool:
+    """Compute last transaction comparison for a single DDF listing."""
+    if not RV_READ_HEADERS:
+        logger.warning("RV_SUPABASE_KEY not set — skipping transaction comparison")
+        return False
+
+    try:
+        # Fetch the DDF row
+        resp = httpx.get(
+            DDF_URL,
+            headers=READ_HEADERS,
+            params={"select": "id,property_name,community,purpose,bedrooms,size_sqft,price_aed", "id": f"eq.{row_id}"},
+            timeout=15,
+        )
+        if resp.status_code != 200 or not resp.json():
+            return False
+        row = resp.json()[0]
+
+        building = row.get("property_name")
+        community = row.get("community", "")
+        purpose = row.get("purpose")
+        bedrooms = row.get("bedrooms")
+        price = row.get("price_aed")
+        size = row.get("size_sqft")
+
+        if not building or not price or bedrooms is None:
+            return False
+
+        # Choose rv_sales or rv_rentals based on purpose
+        if purpose == "Sale":
+            rv_url = RV_SALES_URL
+        elif purpose == "Rent":
+            rv_url = RV_RENTALS_URL
+        else:
+            return False
+
+        # Convert bedrooms: DDF stores "0" for Studio, RV stores 0 as integer
+        try:
+            bed_int = int(bedrooms)
+        except (ValueError, TypeError):
+            return False
+
+        # Multi-strategy search for matching RV transactions
+        matches = _search_rv_transactions(rv_url, building, bed_int)
+
+        # Filter: fuzzy building name match
+        matches = [m for m in matches if _building_fuzzy_match(building, m.get("property_name", ""))]
+
+        # Filter: fuzzy community match
+        matches = [m for m in matches if _community_fuzzy_match(community, m.get("community_name", ""))]
+
+        # Filter by size ±10%
+        if size and int(size) > 0:
+            lo = int(size) * 0.9
+            hi = int(size) * 1.1
+            size_matches = [m for m in matches if m.get("size_sqft") and lo <= float(m["size_sqft"]) <= hi]
+            if size_matches:
+                matches = size_matches
+
+        if not matches:
+            return False
+
+        txn = matches[0]  # Most recent matching transaction
+        txn_price = float(txn["price"])
+        if not txn_price:
+            return False
+
+        txn_change = price - txn_price
+        txn_change_pct = round(((price - txn_price) / txn_price) * 100, 1)
+
+        # Update DDF row with transaction comparison
+        update_resp = httpx.patch(
+            DDF_URL,
+            headers=DDF_UPDATE_HEADERS,
+            params={"id": f"eq.{row_id}"},
+            json={
+                "last_txn_price": txn_price,
+                "last_txn_date": txn.get("date"),
+                "last_txn_change": txn_change,
+                "last_txn_change_pct": txn_change_pct,
+            },
+            timeout=15,
+        )
+        if update_resp.status_code in (200, 204):
+            logger.info(f"Txn computed for row {row_id}: {txn_change_pct}% (AED {txn_change:,.0f}) vs {txn.get('date')}")
+            return True
+        else:
+            logger.warning(f"Txn update failed for row {row_id}: {update_resp.status_code}")
+            return False
+
+    except Exception as e:
+        logger.warning(f"Txn computation failed for row {row_id}: {e}")
+        return False
+
+
+def compute_txns_for_rows(row_ids: list[int]) -> int:
+    """Compute transaction comparisons for a list of DDF row IDs."""
+    if not row_ids:
+        return 0
+    if not RV_READ_HEADERS:
+        logger.warning("RV_SUPABASE_KEY not set — skipping transaction comparisons")
+        return 0
+    logger.info(f"Computing transaction comparisons for {len(row_ids)} rows...")
+    computed = 0
+    for row_id in row_ids:
+        if compute_txn_for_row(row_id):
+            computed += 1
+    logger.info(f"Transaction comparisons computed: {computed}/{len(row_ids)}")
+    return computed
+
+
+def backfill_txns() -> int:
+    """Backfill transaction comparisons for all PF DDF rows with last_txn_price IS NULL."""
+    if not RV_READ_HEADERS:
+        logger.error("RV_SUPABASE_KEY not set — cannot backfill transactions")
+        return 0
+
+    logger.info("=== Backfilling transaction comparisons for all PF rows ===")
+
+    all_ids = []
+    offset = 0
+    batch_size = 1000
+
+    while True:
+        try:
+            resp = httpx.get(
+                DDF_URL,
+                headers=READ_HEADERS,
+                params={
+                    "select": "id",
+                    "source": "eq.Property Finder",
+                    "last_txn_price": "is.null",
+                    "is_valid": "eq.true",
+                    "order": "id.asc",
+                    "limit": str(batch_size),
+                    "offset": str(offset),
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch rows: {resp.status_code} — {resp.text[:200]}")
+                break
+            rows = resp.json()
+            if not rows:
+                break
+            all_ids.extend(r["id"] for r in rows)
+            offset += batch_size
+            logger.info(f"Fetched {len(all_ids)} row IDs so far...")
+        except Exception as e:
+            logger.error(f"Failed to fetch rows: {e}")
+            break
+
+    logger.info(f"Total rows to backfill txns: {len(all_ids)}")
+
+    computed = 0
+    for i, row_id in enumerate(all_ids):
+        if compute_txn_for_row(row_id):
+            computed += 1
+        if (i + 1) % 100 == 0:
+            logger.info(f"Txn progress: {i + 1}/{len(all_ids)} processed, {computed} computed")
+
+    logger.info(f"=== Txn backfill complete: {computed}/{len(all_ids)} computed ===")
     return computed

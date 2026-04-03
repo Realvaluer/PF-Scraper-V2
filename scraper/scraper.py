@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips
+from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns
 
 logging.basicConfig(
     level=logging.INFO,
@@ -445,6 +445,9 @@ def run_scraper(max_pages: int = None):
     # Compute dips for all newly inserted DDF rows
     total_dips = compute_dips_for_rows(all_new_ddf_ids)
 
+    # Compute transaction comparisons for newly inserted DDF rows
+    total_txns = compute_txns_for_rows(all_new_ddf_ids)
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.info(
@@ -455,6 +458,7 @@ def run_scraper(max_pages: int = None):
         f"Total listings scraped: {len(all_listings)}\n"
         f"New DDF rows: {len(all_new_ddf_ids)}\n"
         f"Dips computed: {total_dips}\n"
+        f"Txn comparisons computed: {total_txns}\n"
         f"Price changes detected: {total_price_changes}"
     )
 
@@ -467,5 +471,7 @@ if __name__ == "__main__":
         run_scraper(max_pages=pages)
     elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-dips":
         backfill_dips()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-txns":
+        backfill_txns()
     else:
         run_scraper()
