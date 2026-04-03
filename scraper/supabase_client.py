@@ -976,32 +976,51 @@ def backfill_txns() -> int:
     return computed
 
 
-def reset_txns() -> int:
-    """Clear all last_txn_* fields on PF DDF rows so they can be recomputed."""
-    logger.info("=== Resetting all last_txn_* fields on PF DDF rows ===")
-    try:
-        resp = httpx.patch(
-            DDF_URL,
-            headers=DDF_UPDATE_HEADERS,
-            params={
+def reset_txns(limit: int = 0) -> list[int]:
+    """Clear last_txn_* fields on PF DDF rows. If limit>0, only reset the most recent N rows."""
+    if limit > 0:
+        # Fetch the most recent N rows that have txn data
+        logger.info(f"=== Resetting last_txn_* on most recent {limit} PF rows ===")
+        try:
+            resp = httpx.get(DDF_URL, headers=READ_HEADERS, params={
+                "select": "id",
                 "source": "eq.Property Finder",
                 "is_valid": "eq.true",
                 "last_txn_price": "not.is.null",
-            },
-            json={
-                "last_txn_price": None,
-                "last_txn_date": None,
-                "last_txn_change": None,
-                "last_txn_change_pct": None,
-            },
-            timeout=30,
-        )
-        if resp.status_code in (200, 204):
-            logger.info("All last_txn_* fields cleared")
-            return 1
-        else:
-            logger.error(f"Reset failed: {resp.status_code} — {resp.text[:200]}")
-            return 0
-    except Exception as e:
-        logger.error(f"Reset failed: {e}")
-        return 0
+                "order": "id.desc",
+                "limit": str(limit),
+            }, timeout=30)
+            if resp.status_code != 200 or not resp.json():
+                logger.error(f"No rows found to reset")
+                return []
+            row_ids = [r["id"] for r in resp.json()]
+        except Exception as e:
+            logger.error(f"Failed to fetch rows: {e}")
+            return []
+
+        # Clear each row
+        for rid in row_ids:
+            httpx.patch(DDF_URL, headers=DDF_UPDATE_HEADERS, params={"id": f"eq.{rid}"}, json={
+                "last_txn_price": None, "last_txn_date": None,
+                "last_txn_change": None, "last_txn_change_pct": None,
+            }, timeout=10)
+        logger.info(f"Cleared last_txn_* on {len(row_ids)} rows")
+        return row_ids
+    else:
+        logger.info("=== Resetting all last_txn_* fields on PF DDF rows ===")
+        try:
+            resp = httpx.patch(DDF_URL, headers=DDF_UPDATE_HEADERS, params={
+                "source": "eq.Property Finder",
+                "is_valid": "eq.true",
+                "last_txn_price": "not.is.null",
+            }, json={
+                "last_txn_price": None, "last_txn_date": None,
+                "last_txn_change": None, "last_txn_change_pct": None,
+            }, timeout=30)
+            if resp.status_code in (200, 204):
+                logger.info("All last_txn_* fields cleared")
+            else:
+                logger.error(f"Reset failed: {resp.status_code} — {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"Reset failed: {e}")
+        return []

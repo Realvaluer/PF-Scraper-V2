@@ -542,8 +542,12 @@ if __name__ == "__main__":
     elif args and args[0] == "--backfill-dips":
         backfill_dips()
     elif args and args[0] == "--reset-txns":
-        reset_txns()
-        backfill_txns()
+        limit = int(args[1]) if len(args) > 1 else 0
+        row_ids = reset_txns(limit=limit)
+        if row_ids:
+            compute_txns_for_rows(row_ids)
+        else:
+            backfill_txns()
     elif args and args[0] == "--backfill-txns":
         backfill_txns()
     elif args and args[0] == "--cleanup-duplicates":
