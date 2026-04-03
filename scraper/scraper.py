@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, cleanup_duplicates
+from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, reset_txns, cleanup_duplicates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -541,6 +541,9 @@ if __name__ == "__main__":
         run_scraper(max_pages=pages, property_types=pt_filter)
     elif args and args[0] == "--backfill-dips":
         backfill_dips()
+    elif args and args[0] == "--reset-txns":
+        reset_txns()
+        backfill_txns()
     elif args and args[0] == "--backfill-txns":
         backfill_txns()
     elif args and args[0] == "--cleanup-duplicates":

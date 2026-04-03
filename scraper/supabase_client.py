@@ -974,3 +974,34 @@ def backfill_txns() -> int:
 
     logger.info(f"=== Txn backfill complete: {computed}/{len(all_ids)} computed ===")
     return computed
+
+
+def reset_txns() -> int:
+    """Clear all last_txn_* fields on PF DDF rows so they can be recomputed."""
+    logger.info("=== Resetting all last_txn_* fields on PF DDF rows ===")
+    try:
+        resp = httpx.patch(
+            DDF_URL,
+            headers=DDF_UPDATE_HEADERS,
+            params={
+                "source": "eq.Property Finder",
+                "is_valid": "eq.true",
+                "last_txn_price": "not.is.null",
+            },
+            json={
+                "last_txn_price": None,
+                "last_txn_date": None,
+                "last_txn_change": None,
+                "last_txn_change_pct": None,
+            },
+            timeout=30,
+        )
+        if resp.status_code in (200, 204):
+            logger.info("All last_txn_* fields cleared")
+            return 1
+        else:
+            logger.error(f"Reset failed: {resp.status_code} — {resp.text[:200]}")
+            return 0
+    except Exception as e:
+        logger.error(f"Reset failed: {e}")
+        return 0
