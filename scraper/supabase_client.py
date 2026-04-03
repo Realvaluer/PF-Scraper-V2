@@ -386,7 +386,50 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
     if inserted_ids:
         invalidate_old_ddf_rows(inserted_ids)
 
+    # Update existing rows with ready_off_plan and furnished (fields that may have been missing)
+    _update_existing_ddf_fields(ddf_rows)
+
     return inserted_ids
+
+
+def _update_existing_ddf_fields(ddf_rows: list[dict]) -> int:
+    """Update existing DDF rows with ready_off_plan and furnished for rows that already existed."""
+    updated = 0
+    for row in ddf_rows:
+        ref = row.get("reference_no")
+        purpose = row.get("purpose")
+        ready = row.get("ready_off_plan")
+        furnished = row.get("furnished")
+        if not ref or (not ready and not furnished):
+            continue
+
+        patch = {}
+        if ready:
+            patch["ready_off_plan"] = ready
+        if furnished:
+            patch["furnished"] = furnished
+
+        try:
+            resp = httpx.patch(
+                DDF_URL,
+                headers=DDF_UPDATE_HEADERS,
+                params={
+                    "reference_no": f"eq.{ref}",
+                    "purpose": f"eq.{purpose}",
+                    "source": "eq.Property Finder",
+                    "is_valid": "eq.true",
+                },
+                json=patch,
+                timeout=10,
+            )
+            if resp.status_code in (200, 204):
+                updated += 1
+        except Exception:
+            pass
+
+    if updated:
+        logger.info(f"Updated ready_off_plan/furnished on {updated} existing rows")
+    return updated
 
 
 # ── Dip Computation ───────────────────────────────────────────────────────────

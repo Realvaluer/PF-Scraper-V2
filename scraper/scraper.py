@@ -30,6 +30,42 @@ SCRAPE_TARGETS = [
         "stored_type": "sale",
         "property_type": "apartment",
     },
+    {
+        "url": "https://www.propertyfinder.ae/en/rent/dubai/villas-for-rent.html",
+        "label": "Dubai Villas (rent)",
+        "stored_type": "rent",
+        "property_type": "villa",
+    },
+    {
+        "url": "https://www.propertyfinder.ae/en/buy/dubai/villas-for-sale.html",
+        "label": "Dubai Villas (sale)",
+        "stored_type": "sale",
+        "property_type": "villa",
+    },
+    {
+        "url": "https://www.propertyfinder.ae/en/rent/dubai/townhouses-for-rent.html",
+        "label": "Dubai Townhouses (rent)",
+        "stored_type": "rent",
+        "property_type": "townhouse",
+    },
+    {
+        "url": "https://www.propertyfinder.ae/en/buy/dubai/townhouses-for-sale.html",
+        "label": "Dubai Townhouses (sale)",
+        "stored_type": "sale",
+        "property_type": "townhouse",
+    },
+    {
+        "url": "https://www.propertyfinder.ae/en/buy/dubai/penthouses-for-sale.html",
+        "label": "Dubai Penthouses (sale)",
+        "stored_type": "sale",
+        "property_type": "penthouse",
+    },
+    {
+        "url": "https://www.propertyfinder.ae/en/buy/dubai/land-for-sale.html",
+        "label": "Dubai Land (sale)",
+        "stored_type": "sale",
+        "property_type": "land",
+    },
 ]
 
 MAX_PAGES_PER_TARGET = 5
