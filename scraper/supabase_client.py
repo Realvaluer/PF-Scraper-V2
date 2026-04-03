@@ -544,12 +544,24 @@ STOP_WORDS = {"dubai", "the", "al", "el", "de", "at", "in", "on", "by"}
 def _normalize_building_name(s: str) -> str:
     """Normalize building name for comparison."""
     s = s.lower().strip()
+    s = s.replace('&', 'and')
+    s = s.replace('-', ' ')
     s = re.sub(r'\btowers?\b', 'tower', s)
     s = re.sub(r'\bresidences?\b', 'residence', s)
     s = re.sub(r'\bbuildings?\b', '', s)
     s = re.sub(r'\bhouses?\b', 'house', s)
+    s = re.sub(r"\bthe\b", '', s)
+    # Strip sub-area suffixes for buildings like "Eden House Zaabeel" / "Eden House DIFC"
+    s = re.sub(r"\b(zaabeel|za'abeel|difc|jlt|jvc|jvt|downtown|marina)\b", '', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
+
+
+def _extract_building_number(s: str) -> str:
+    """Extract trailing number/letter from building name (e.g., '2' from 'Elitz 2', 'B' from 'Tower B')."""
+    s = s.lower().strip()
+    m = re.search(r'(\d+|[a-z])\s*$', s)
+    return m.group(1) if m else ""
 
 
 def _building_fuzzy_match(pf_name: str, rv_name: str) -> bool:
@@ -567,7 +579,14 @@ def _building_fuzzy_match(pf_name: str, rv_name: str) -> bool:
         return False
     overlap = wa & wb
     smaller = min(len(wa), len(wb))
-    return len(overlap) >= max(2, smaller * 0.7)
+    if len(overlap) < max(2, smaller * 0.7):
+        return False
+    # If both names end with a number/letter, they must match
+    num_a = _extract_building_number(a)
+    num_b = _extract_building_number(b)
+    if num_a and num_b and num_a != num_b:
+        return False
+    return True
 
 
 def _community_fuzzy_match(community_a: str, community_b: str) -> bool:
