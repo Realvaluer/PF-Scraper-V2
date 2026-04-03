@@ -142,7 +142,7 @@ def upsert_listings(listings: list[dict]) -> None:
         return
 
     # Remove fields not in pf_listings_v2 schema
-    PF_EXCLUDE = {"bathrooms", "scraped_at"}
+    PF_EXCLUDE = {"bathrooms", "scraped_at", "ready_off_plan", "furnished"}
     listings = [{k: v for k, v in l.items() if k not in PF_EXCLUDE} for l in listings]
     listings = sanitize_listings(listings)
 
@@ -191,8 +191,9 @@ def compute_dup_hash(ref: str, source: str, price, url: str = "") -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, float]:
-    """Fetch latest price_aed per reference_no from ddf_listings."""
+def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, tuple]:
+    """Fetch latest price_aed and date_listed per reference_no from ddf_listings.
+    Returns dict mapping reference_no -> (price, date_listed)."""
     if not reference_nos:
         return {}
 
@@ -203,7 +204,7 @@ def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, float]:
             DDF_URL,
             headers=READ_HEADERS,
             params={
-                "select": "reference_no,price_aed",
+                "select": "reference_no,price_aed,date_listed",
                 "source": "eq.Property Finder",
                 "reference_no": f"in.({refs_csv})",
                 "order": "scraped_at.desc",
@@ -215,8 +216,9 @@ def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, float]:
                 ref = row.get("reference_no", "")
                 if ref and ref not in prices:  # first = latest due to desc order
                     price = row.get("price_aed", 0)
+                    date = row.get("date_listed", "")
                     if price:
-                        prices[ref] = float(price)
+                        prices[ref] = (float(price), date)
             logger.info(f"DDF: fetched {len(prices)} existing prices")
         else:
             logger.warning(f"DDF price fetch failed: {response.status_code} — {response.text[:200]}")
@@ -307,10 +309,14 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
 
         # listing_change: price difference from previous DDF row
         listing_change = None
-        if ref in existing_prices and existing_prices[ref] > 0 and price_aed > 0:
-            diff = price_aed - int(existing_prices[ref])
-            if diff != 0:
-                listing_change = diff
+        listing_change_date = None
+        if ref in existing_prices:
+            prev_price, prev_date = existing_prices[ref]
+            if prev_price > 0 and price_aed > 0:
+                diff = price_aed - int(prev_price)
+                if diff != 0:
+                    listing_change = diff
+                    listing_change_date = prev_date
 
         # Map fields
         raw_type = l.get("listing_type", "")
@@ -320,6 +326,12 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
         prop_type = raw_prop_type.capitalize() if raw_prop_type else ""
 
         date_listed = scraped_at[:10] if scraped_at else None
+
+        # furnished mapping
+        furnished = l.get("furnished", "")
+
+        # ready_off_plan mapping
+        ready_off_plan = l.get("ready_off_plan", "")
 
         ddf_rows.append({
             "reference_no": ref,
@@ -339,6 +351,9 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
             "is_valid": True,
             "dup_hash": dup_hash,
             "listing_change": listing_change,
+            "listing_change_date": listing_change_date,
+            "ready_off_plan": ready_off_plan or None,
+            "furnished": furnished or None,
         })
 
     ddf_rows = sanitize_listings(ddf_rows)
@@ -533,6 +548,85 @@ def backfill_dips() -> int:
 
     logger.info(f"=== Backfill complete: {computed}/{len(all_ids)} dips computed ===")
     return computed
+
+
+def cleanup_duplicates() -> int:
+    """Find all reference_no + purpose combos with multiple is_valid=true rows, keep only the latest."""
+    logger.info("=== Cleaning up duplicate is_valid rows ===")
+
+    # Fetch all valid PF rows, ordered by scraped_at desc
+    all_rows = []
+    offset = 0
+    batch_size = 1000
+
+    while True:
+        try:
+            resp = httpx.get(
+                DDF_URL,
+                headers=READ_HEADERS,
+                params={
+                    "select": "id,reference_no,purpose,scraped_at",
+                    "source": "eq.Property Finder",
+                    "is_valid": "eq.true",
+                    "order": "scraped_at.desc",
+                    "limit": str(batch_size),
+                    "offset": str(offset),
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch rows: {resp.status_code}")
+                break
+            rows = resp.json()
+            if not rows:
+                break
+            all_rows.extend(rows)
+            offset += batch_size
+            logger.info(f"Fetched {len(all_rows)} rows so far...")
+        except Exception as e:
+            logger.error(f"Failed to fetch rows: {e}")
+            break
+
+    logger.info(f"Total valid PF rows: {len(all_rows)}")
+
+    # Group by reference_no + purpose, find duplicates
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for row in all_rows:
+        key = (row.get("reference_no", ""), row.get("purpose", ""))
+        groups[key].append(row)
+
+    ids_to_invalidate = []
+    for key, rows in groups.items():
+        if len(rows) > 1:
+            # First row is latest (ordered by scraped_at desc), invalidate the rest
+            for row in rows[1:]:
+                ids_to_invalidate.append(row["id"])
+
+    logger.info(f"Found {len(ids_to_invalidate)} duplicate rows to invalidate")
+
+    # Invalidate in batches
+    invalidated = 0
+    for i in range(0, len(ids_to_invalidate), 50):
+        batch = ids_to_invalidate[i : i + 50]
+        ids_csv = ",".join(str(rid) for rid in batch)
+        try:
+            resp = httpx.patch(
+                DDF_URL,
+                headers=DDF_UPDATE_HEADERS,
+                params={"id": f"in.({ids_csv})"},
+                json={"is_valid": False},
+                timeout=15,
+            )
+            if resp.status_code in (200, 204):
+                invalidated += len(batch)
+            else:
+                logger.warning(f"Cleanup batch failed: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Cleanup batch failed: {e}")
+
+    logger.info(f"=== Cleanup complete: {invalidated} duplicate rows invalidated ===")
+    return invalidated
 
 
 # ── Transaction Comparison (Listing vs DLD) ──────────────────────────────────

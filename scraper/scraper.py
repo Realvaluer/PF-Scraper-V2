@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns
+from supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, cleanup_duplicates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,6 +194,26 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 except (ValueError, TypeError):
                     price_per_sqft = 0
 
+                # completion_status → ready_off_plan
+                completion_raw = prop.get("completion_status", "")
+                if completion_raw in ("off_plan", "off_plan_primary"):
+                    ready_off_plan = "Off-plan"
+                elif completion_raw == "completed":
+                    ready_off_plan = "Ready"
+                else:
+                    ready_off_plan = ""
+
+                # furnished
+                furnished_raw = prop.get("furnished", "")
+                if furnished_raw == "YES":
+                    furnished = "Furnished"
+                elif furnished_raw == "PARTLY":
+                    furnished = "Partly Furnished"
+                elif furnished_raw == "NO":
+                    furnished = "Unfurnished"
+                else:
+                    furnished = ""
+
                 # Skip listings with no useful data
                 if not reference_no and not price and not size_sqft:
                     logger.warning(f"Skipping empty listing")
@@ -211,6 +231,8 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                     "price": price,
                     "price_per_sqft": price_per_sqft,
                     "listing_url": listing_url,
+                    "ready_off_plan": ready_off_plan,
+                    "furnished": furnished,
                 })
             except Exception as e:
                 logger.warning(f"Failed to parse listing: {e}")
@@ -473,5 +495,7 @@ if __name__ == "__main__":
         backfill_dips()
     elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-txns":
         backfill_txns()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--cleanup-duplicates":
+        cleanup_duplicates()
     else:
         run_scraper()
