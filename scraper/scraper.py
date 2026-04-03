@@ -338,10 +338,13 @@ def pass_waf_challenge(page) -> bool:
         return False
 
 
-def run_scraper(max_pages: int = None):
+def run_scraper(max_pages: int = None, property_types: list[str] = None):
     pages = max_pages or MAX_PAGES_PER_TARGET
+    targets = SCRAPE_TARGETS
+    if property_types:
+        targets = [t for t in targets if t["property_type"] in property_types]
     start_time = datetime.now(timezone.utc)
-    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages per target) ===")
+    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets) ===")
 
     all_listings = []
     all_new_ddf_ids = []
@@ -374,7 +377,7 @@ def run_scraper(max_pages: int = None):
         pass_waf_challenge(page)
         time.sleep(random.uniform(3, 5))
 
-        for idx, target in enumerate(SCRAPE_TARGETS):
+        for idx, target in enumerate(targets):
             label = target["label"]
             stored_type = target["stored_type"]
             property_type = target["property_type"]
@@ -523,15 +526,24 @@ def run_scraper(max_pages: int = None):
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--backfill":
-        pages = int(sys.argv[2]) if len(sys.argv) > 2 else BACKFILL_DEFAULT_PAGES
+    # Parse --property-type from any position
+    pt_filter = None
+    args = sys.argv[1:]
+    if "--property-type" in args:
+        pt_idx = args.index("--property-type")
+        if pt_idx + 1 < len(args):
+            pt_filter = [t.strip() for t in args[pt_idx + 1].split(",")]
+            args = args[:pt_idx] + args[pt_idx + 2:]
+
+    if args and args[0] == "--backfill":
+        pages = int(args[1]) if len(args) > 1 else BACKFILL_DEFAULT_PAGES
         logger.info(f"=== BACKFILL MODE: {pages} pages per target ===")
-        run_scraper(max_pages=pages)
-    elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-dips":
+        run_scraper(max_pages=pages, property_types=pt_filter)
+    elif args and args[0] == "--backfill-dips":
         backfill_dips()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-txns":
+    elif args and args[0] == "--backfill-txns":
         backfill_txns()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--cleanup-duplicates":
+    elif args and args[0] == "--cleanup-duplicates":
         cleanup_duplicates()
     else:
-        run_scraper()
+        run_scraper(property_types=pt_filter)
