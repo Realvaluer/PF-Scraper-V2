@@ -71,6 +71,57 @@ SCRAPE_TARGETS = [
 MAX_PAGES_PER_TARGET = 5
 BACKFILL_DEFAULT_PAGES = 50
 
+# ── Full Backfill Targets (bedroom + price splits to stay under 249 pages) ────
+
+PF_RENT = "https://www.propertyfinder.ae/en/rent/dubai"
+PF_SALE = "https://www.propertyfinder.ae/en/buy/dubai"
+
+BACKFILL_BATCH_1 = [  # Apt Rent — ~11 targets
+    {"url": f"{PF_RENT}/studio-apartments-for-rent.html", "label": "Rent Studio", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/1-bedroom-apartments-for-rent.html?price_to=60000", "label": "Rent 1BR <60K", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/1-bedroom-apartments-for-rent.html?price_from=60000&price_to=100000", "label": "Rent 1BR 60K-100K", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/1-bedroom-apartments-for-rent.html?price_from=100000", "label": "Rent 1BR >100K", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/2-bedroom-apartments-for-rent.html?price_to=80000", "label": "Rent 2BR <80K", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/2-bedroom-apartments-for-rent.html?price_from=80000&price_to=150000", "label": "Rent 2BR 80K-150K", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/2-bedroom-apartments-for-rent.html?price_from=150000", "label": "Rent 2BR >150K", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/3-bedroom-apartments-for-rent.html", "label": "Rent 3BR", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/4-bedroom-apartments-for-rent.html", "label": "Rent 4BR", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/5-bedroom-apartments-for-rent.html", "label": "Rent 5BR+", "stored_type": "rent", "property_type": "apartment"},
+    {"url": f"{PF_RENT}/6-bedroom-apartments-for-rent.html", "label": "Rent 6BR+", "stored_type": "rent", "property_type": "apartment"},
+]
+
+BACKFILL_BATCH_2 = [  # Apt Sale — ~12 targets
+    {"url": f"{PF_SALE}/studio-apartments-for-sale.html?price_to=500000", "label": "Sale Studio <500K", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/studio-apartments-for-sale.html?price_from=500000&price_to=1000000", "label": "Sale Studio 500K-1M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/studio-apartments-for-sale.html?price_from=1000000", "label": "Sale Studio >1M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/1-bedroom-apartments-for-sale.html?price_to=1000000", "label": "Sale 1BR <1M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/1-bedroom-apartments-for-sale.html?price_from=1000000&price_to=2000000", "label": "Sale 1BR 1M-2M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/1-bedroom-apartments-for-sale.html?price_from=2000000&price_to=4000000", "label": "Sale 1BR 2M-4M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/1-bedroom-apartments-for-sale.html?price_from=4000000", "label": "Sale 1BR >4M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/2-bedroom-apartments-for-sale.html?price_to=1500000", "label": "Sale 2BR <1.5M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/2-bedroom-apartments-for-sale.html?price_from=1500000&price_to=3000000", "label": "Sale 2BR 1.5M-3M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/2-bedroom-apartments-for-sale.html?price_from=3000000", "label": "Sale 2BR >3M", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/3-bedroom-apartments-for-sale.html", "label": "Sale 3BR", "stored_type": "sale", "property_type": "apartment"},
+    {"url": f"{PF_SALE}/4-bedroom-apartments-for-sale.html", "label": "Sale 4BR+", "stored_type": "sale", "property_type": "apartment"},
+]
+
+BACKFILL_BATCH_3 = [  # Villas + Townhouses + Penthouses + Land — ~8 targets
+    {"url": f"{PF_SALE}/villas-for-sale.html", "label": "Villa Sale", "stored_type": "sale", "property_type": "villa"},
+    {"url": f"{PF_RENT}/villas-for-rent.html", "label": "Villa Rent", "stored_type": "rent", "property_type": "villa"},
+    {"url": f"{PF_SALE}/townhouses-for-sale.html", "label": "Townhouse Sale", "stored_type": "sale", "property_type": "townhouse"},
+    {"url": f"{PF_RENT}/townhouses-for-rent.html", "label": "Townhouse Rent", "stored_type": "rent", "property_type": "townhouse"},
+    {"url": f"{PF_SALE}/penthouses-for-sale.html", "label": "Penthouse Sale", "stored_type": "sale", "property_type": "penthouse"},
+    {"url": f"{PF_RENT}/penthouses-for-rent.html", "label": "Penthouse Rent", "stored_type": "rent", "property_type": "penthouse"},
+    {"url": f"{PF_SALE}/land-for-sale.html", "label": "Land Sale", "stored_type": "sale", "property_type": "land"},
+]
+
+BACKFILL_BATCHES = {
+    "1": BACKFILL_BATCH_1,
+    "2": BACKFILL_BATCH_2,
+    "3": BACKFILL_BATCH_3,
+    "all": BACKFILL_BATCH_1 + BACKFILL_BATCH_2 + BACKFILL_BATCH_3,
+}
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -338,10 +389,10 @@ def pass_waf_challenge(page) -> bool:
         return False
 
 
-def run_scraper(max_pages: int = None, property_types: list[str] = None):
+def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_targets: list[dict] = None):
     pages = max_pages or MAX_PAGES_PER_TARGET
-    targets = SCRAPE_TARGETS
-    if property_types:
+    targets = custom_targets or SCRAPE_TARGETS
+    if property_types and not custom_targets:
         targets = [t for t in targets if t["property_type"] in property_types]
     start_time = datetime.now(timezone.utc)
     logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets) ===")
@@ -403,7 +454,12 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None):
                     logger.error(f"3 failures for {label} — moving on")
                     break
 
-                url = base_url if page_num == 1 else f"{base_url}?page={page_num}"
+                if page_num == 1:
+                    url = base_url
+                elif "?" in base_url:
+                    url = f"{base_url}&page={page_num}"
+                else:
+                    url = f"{base_url}?page={page_num}"
                 try:
                     logger.info(f"Page {page_num}: {url}")
                     page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -535,7 +591,15 @@ if __name__ == "__main__":
             pt_filter = [t.strip() for t in args[pt_idx + 1].split(",")]
             args = args[:pt_idx] + args[pt_idx + 2:]
 
-    if args and args[0] == "--backfill":
+    if args and args[0] == "--backfill-full":
+        batch = args[1] if len(args) > 1 else "all"
+        if batch not in BACKFILL_BATCHES:
+            logger.error(f"Invalid batch: {batch}. Use 1, 2, 3, or all")
+            sys.exit(1)
+        targets = BACKFILL_BATCHES[batch]
+        logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, 249 pages each ===")
+        run_scraper(max_pages=249, custom_targets=targets)
+    elif args and args[0] == "--backfill":
         pages = int(args[1]) if len(args) > 1 else BACKFILL_DEFAULT_PAGES
         logger.info(f"=== BACKFILL MODE: {pages} pages per target ===")
         run_scraper(max_pages=pages, property_types=pt_filter)
