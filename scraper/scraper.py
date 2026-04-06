@@ -301,6 +301,10 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                 else:
                     furnished = ""
 
+                # Dates from PF
+                listed_date = prop.get("listed_date", "") or prop.get("added_on", "") or ""
+                last_refreshed_at = prop.get("last_refreshed_at", "") or ""
+
                 # Skip listings with no useful data
                 if not reference_no and not price and not size_sqft:
                     logger.warning(f"Skipping empty listing")
@@ -320,6 +324,8 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
                     "listing_url": listing_url,
                     "ready_off_plan": ready_off_plan,
                     "furnished": furnished,
+                    "listed_date": listed_date,
+                    "last_refreshed_at": last_refreshed_at,
                 })
             except Exception as e:
                 logger.warning(f"Failed to parse listing: {e}")

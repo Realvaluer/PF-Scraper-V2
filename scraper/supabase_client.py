@@ -325,7 +325,14 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
         raw_prop_type = l.get("property_type", "")
         prop_type = raw_prop_type.capitalize() if raw_prop_type else ""
 
-        date_listed = scraped_at[:10] if scraped_at else None
+        # Use PF's listed_date (full timestamp) instead of scrape date
+        listed_date_raw = l.get("listed_date", "")
+        date_listed = listed_date_raw if listed_date_raw else (scraped_at[:10] if scraped_at else None)
+
+        # Use PF's last_refreshed_at for listing_change_date if we detected a price change
+        last_refreshed = l.get("last_refreshed_at", "")
+        if listing_change and last_refreshed:
+            listing_change_date = last_refreshed
 
         # furnished mapping
         furnished = l.get("furnished", "")
@@ -339,7 +346,7 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
             "type": prop_type,
             "community": l.get("community", ""),
             "property_name": l.get("building", ""),
-            "bedrooms": "0" if l.get("bedrooms") == "Studio" else l.get("bedrooms", ""),
+            "bedrooms": l.get("bedrooms", ""),
             "bathrooms": l.get("bathrooms") or None,
             "size_sqft": int(l.get("size_sqft", 0) or 0),
             "price_aed": price_aed,
@@ -393,21 +400,31 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
 
 
 def _update_existing_ddf_fields(ddf_rows: list[dict]) -> int:
-    """Update existing DDF rows with ready_off_plan and furnished for rows that already existed."""
+    """Update existing DDF rows with fields that may have been missing."""
     updated = 0
     for row in ddf_rows:
         ref = row.get("reference_no")
         purpose = row.get("purpose")
-        ready = row.get("ready_off_plan")
-        furnished = row.get("furnished")
-        if not ref or (not ready and not furnished):
+        if not ref:
             continue
 
         patch = {}
+        ready = row.get("ready_off_plan")
+        furnished = row.get("furnished")
+        date_listed = row.get("date_listed")
+        bedrooms = row.get("bedrooms")
+
         if ready:
             patch["ready_off_plan"] = ready
         if furnished:
             patch["furnished"] = furnished
+        if date_listed:
+            patch["date_listed"] = date_listed
+        if bedrooms == "Studio":
+            patch["bedrooms"] = "Studio"
+
+        if not patch:
+            continue
 
         try:
             resp = httpx.patch(
@@ -428,7 +445,7 @@ def _update_existing_ddf_fields(ddf_rows: list[dict]) -> int:
             pass
 
     if updated:
-        logger.info(f"Updated ready_off_plan/furnished on {updated} existing rows")
+        logger.info(f"Updated existing fields (date_listed/bedrooms/ready/furnished) on {updated} rows")
     return updated
 
 
