@@ -1,14 +1,16 @@
 import json
 import logging
+import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+import httpx
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, reset_txns, cleanup_duplicates
+from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, reset_txns, cleanup_duplicates, fetch_latest_listed_date
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,59 +19,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SCRAPE_TARGETS = [
-    {
-        "url": "https://www.propertyfinder.ae/en/rent/dubai/apartments-for-rent.html",
-        "label": "Dubai Apartments (rent)",
-        "stored_type": "rent",
-        "property_type": "apartment",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/buy/dubai/apartments-for-sale.html",
-        "label": "Dubai Apartments (sale)",
-        "stored_type": "sale",
-        "property_type": "apartment",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/rent/dubai/villas-for-rent.html",
-        "label": "Dubai Villas (rent)",
-        "stored_type": "rent",
-        "property_type": "villa",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/buy/dubai/villas-for-sale.html",
-        "label": "Dubai Villas (sale)",
-        "stored_type": "sale",
-        "property_type": "villa",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/rent/dubai/townhouses-for-rent.html",
-        "label": "Dubai Townhouses (rent)",
-        "stored_type": "rent",
-        "property_type": "townhouse",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/buy/dubai/townhouses-for-sale.html",
-        "label": "Dubai Townhouses (sale)",
-        "stored_type": "sale",
-        "property_type": "townhouse",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/buy/dubai/penthouses-for-sale.html",
-        "label": "Dubai Penthouses (sale)",
-        "stored_type": "sale",
-        "property_type": "penthouse",
-    },
-    {
-        "url": "https://www.propertyfinder.ae/en/buy/dubai/land-for-sale.html",
-        "label": "Dubai Land (sale)",
-        "stored_type": "sale",
-        "property_type": "land",
-    },
+MAX_PAGES_SAFETY_NET = 30
+BACKFILL_DEFAULT_PAGES = 50
+
+# ── Helper to generate targets ────────────────────────────────────────────────
+
+PF_BASE = "https://www.propertyfinder.ae/en"
+
+EMIRATES = [
+    ("dubai", "Dubai"),
+    ("abu-dhabi", "Abu Dhabi"),
+    ("sharjah", "Sharjah"),
+    ("ajman", "Ajman"),
+    ("ras-al-khaimah", "Ras Al Khaimah"),
+    ("fujairah", "Fujairah"),
+    ("umm-al-quwain", "Umm Al Quwain"),
 ]
 
-MAX_PAGES_PER_TARGET = 5
-BACKFILL_DEFAULT_PAGES = 50
+RESIDENTIAL_TYPES = [
+    ("apartments", "apartment"),
+    ("villas", "villa"),
+    ("townhouses", "townhouse"),
+    ("penthouses", "penthouse"),
+]
+
+COMMERCIAL_TYPES = [
+    ("offices", "office"),
+    ("warehouses", "warehouse"),
+    ("shops", "shop"),
+    ("showrooms", "showroom"),
+    ("commercial-buildings", "commercial building"),
+]
+
+def _build_targets():
+    targets = []
+    for slug, city in EMIRATES:
+        # Residential rent + sale
+        for ptype_slug, ptype in RESIDENTIAL_TYPES:
+            targets.append({"url": f"{PF_BASE}/rent/{slug}/{ptype_slug}-for-rent.html", "label": f"{city} {ptype.title()} (rent)", "stored_type": "rent", "property_type": ptype, "city": city, "category": "Residential"})
+            targets.append({"url": f"{PF_BASE}/buy/{slug}/{ptype_slug}-for-sale.html", "label": f"{city} {ptype.title()} (sale)", "stored_type": "sale", "property_type": ptype, "city": city, "category": "Residential"})
+        # Residential land (sale only)
+        targets.append({"url": f"{PF_BASE}/buy/{slug}/land-for-sale.html", "label": f"{city} Land (sale)", "stored_type": "sale", "property_type": "land", "city": city, "category": "Residential"})
+        # Commercial rent + sale (PF uses /commercial-rent/ and /commercial-buy/ paths)
+        for ctype_slug, ctype in COMMERCIAL_TYPES:
+            targets.append({"url": f"{PF_BASE}/commercial-rent/{slug}/{ctype_slug}-for-rent.html", "label": f"{city} {ctype.title()} (rent)", "stored_type": "rent", "property_type": ctype, "city": city, "category": "Commercial"})
+            targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/{ctype_slug}-for-sale.html", "label": f"{city} {ctype.title()} (sale)", "stored_type": "sale", "property_type": ctype, "city": city, "category": "Commercial"})
+        # Commercial land (sale only)
+        targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/land-for-sale.html", "label": f"{city} Commercial Land (sale)", "stored_type": "sale", "property_type": "commercial land", "city": city, "category": "Commercial"})
+    return targets
+
+SCRAPE_TARGETS = _build_targets()
 
 # ── Full Backfill Targets (bedroom + price splits to stay under 249 pages) ────
 
@@ -398,17 +397,123 @@ def pass_waf_challenge(page) -> bool:
         return False
 
 
-def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_targets: list[dict] = None):
-    pages = max_pages or MAX_PAGES_PER_TARGET
+def _get_cutoff_for_target(target: dict) -> str | None:
+    """Get the smart cutoff timestamp for a target (latest listed_date - 5 min).
+    Returns ISO timestamp string, or None if no prior data exists (scrape all pages)."""
+    purpose = "Rent" if target["stored_type"] == "rent" else "Sale"
+    city = target.get("city", "Dubai")
+
+    latest = fetch_latest_listed_date(purpose, city)
+    if not latest:
+        logger.info(f"No prior listed_date for {purpose}/{city} — will scrape up to page limit")
+        return None
+
+    try:
+        # Parse ISO timestamp — handle both "Z" and "+00:00" formats
+        ts = latest.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        cutoff = dt - timedelta(minutes=5)
+        cutoff_str = cutoff.isoformat()
+        logger.info(f"Smart cutoff for {purpose}/{city}: {cutoff_str} (latest={latest})")
+        return cutoff_str
+    except Exception as e:
+        logger.warning(f"Failed to parse latest listed_date '{latest}': {e}")
+        return None
+
+
+def _all_listings_older_than_cutoff(page_listings: list[dict], cutoff: str) -> bool:
+    """Check if ALL listings on a page have listed_date older than the cutoff."""
+    if not page_listings:
+        return False
+    for l in page_listings:
+        ld = l.get("listed_date", "")
+        if not ld:
+            # No date — can't determine, assume it's new
+            return False
+        try:
+            ts = ld.replace("Z", "+00:00")
+            if ts >= cutoff:
+                return False  # At least one listing is newer than cutoff
+        except Exception:
+            return False
+    return True
+
+
+def send_resend_notification(
+    total_scraped: int,
+    new_ddf: int,
+    dubai_sale: int,
+    dubai_rent: int,
+    total_dips: int,
+    total_txns: int,
+    price_changes: int,
+    duration_s: float,
+    target_count: int,
+):
+    """Send email notification via Resend after scrape completes."""
+    resend_api_key = os.environ.get("RESEND_API_KEY", "")
+    resend_to = os.environ.get("RESEND_TO", "")
+    if not resend_api_key or not resend_to:
+        logger.info("RESEND_API_KEY or RESEND_TO not set — skipping email notification")
+        return
+
+    mins = int(duration_s // 60)
+    secs = int(duration_s % 60)
+
+    subject = f"PF Scraper: {new_ddf} new listings ({dubai_sale} sale, {dubai_rent} rent)"
+
+    html_body = f"""
+    <h2>PF Scraper V2 — Run Complete</h2>
+    <table style="border-collapse:collapse; font-family:Arial,sans-serif;">
+      <tr><td style="padding:4px 12px;"><b>Targets scraped</b></td><td>{target_count}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>Total listings scraped</b></td><td>{total_scraped:,}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>New DDF rows</b></td><td>{new_ddf:,}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>Dubai Sale (new)</b></td><td>{dubai_sale:,}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>Dubai Rent (new)</b></td><td>{dubai_rent:,}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>Dips computed</b></td><td>{total_dips}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>Txn comparisons</b></td><td>{total_txns}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>Price changes</b></td><td>{price_changes}</td></tr>
+      <tr><td style="padding:4px 12px;"><b>Duration</b></td><td>{mins}m {secs}s</td></tr>
+    </table>
+    """
+
+    try:
+        resp = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "PF Scraper <notifications@dxpdipfinder.com>",
+                "to": [resend_to],
+                "subject": subject,
+                "html": html_body,
+            },
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            logger.info(f"Resend notification sent to {resend_to}")
+        else:
+            logger.warning(f"Resend failed: {resp.status_code} — {resp.text[:200]}")
+    except Exception as e:
+        logger.warning(f"Resend notification failed: {e}")
+
+
+def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_targets: list[dict] = None, smart_stop: bool = True):
+    pages = max_pages or MAX_PAGES_SAFETY_NET
     targets = custom_targets or SCRAPE_TARGETS
     if property_types and not custom_targets:
         targets = [t for t in targets if t["property_type"] in property_types]
     start_time = datetime.now(timezone.utc)
-    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets) ===")
+    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets, smart_stop={smart_stop}) ===")
 
     all_listings = []
     all_new_ddf_ids = []
     total_price_changes = 0
+    # Track Dubai sale/rent counts for notification
+    dubai_sale_new = 0
+    dubai_rent_new = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -442,8 +547,15 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
             stored_type = target["stored_type"]
             property_type = target["property_type"]
             base_url = target["url"]
+            city = target.get("city", "Dubai")
+            category = target.get("category", "Residential")
 
-            logger.info(f"\n--- {label} (max {pages} pages) ---")
+            # Smart stop: get cutoff timestamp for this target
+            cutoff = None
+            if smart_stop:
+                cutoff = _get_cutoff_for_target(target)
+
+            logger.info(f"\n--- [{idx+1}/{len(targets)}] {label} (max {pages} pages, cutoff={cutoff or 'none'}) ---")
 
             # Re-warm WAF between targets (not on first one)
             if idx > 0:
@@ -455,6 +567,7 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                     logger.warning(f"WAF re-warm failed: {e}")
 
             target_listings = []
+            target_new_ids = []
             page_num = 1
             failures = 0
 
@@ -481,7 +594,6 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                     if len(content) < 5000:
                         logger.warning("Page too small — likely blocked by WAF")
                         failures += 1
-                        # Try to re-pass WAF
                         logger.info("Attempting WAF re-pass...")
                         pass_waf_challenge(page)
                         time.sleep(random.uniform(3, 5))
@@ -496,6 +608,11 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                             failures += 1
                             continue
 
+                    # Check for 404 / no results page
+                    if "no properties found" in content.lower() or "page not found" in content.lower()[:3000]:
+                        logger.info(f"No results for {label} — skipping target")
+                        break
+
                     page_listings = extract_listings(content, stored_type, property_type)
 
                     if not page_listings:
@@ -503,6 +620,12 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                         failures += 1
                     else:
                         failures = 0
+
+                        # Inject city and category from target into each listing
+                        for l in page_listings:
+                            l["city"] = city
+                            l["category"] = category
+
                         target_listings.extend(page_listings)
                         logger.info(f"Got {len(page_listings)} listings (total: {len(target_listings)})")
 
@@ -511,47 +634,26 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                             first = page_listings[0]
                             logger.info(
                                 f"Sample: ref={first['reference_no']}, "
+                                f"city={city}, cat={category}, "
                                 f"community={first['community']}, "
                                 f"building={first['building']}, "
                                 f"beds={first['bedrooms']}, "
                                 f"price={first['price']}, "
                                 f"size={first['size_sqft']}, "
-                                f"url={first['listing_url'][:60]}"
+                                f"listed_date={first.get('listed_date','')[:20]}"
                             )
 
-                        # Check for price changes before upserting
-                        ref_nos = [l["reference_no"] for l in page_listings if l["reference_no"]]
-                        current_prices = fetch_current_prices(ref_nos, stored_type)
+                        # Smart stop: check if all listings on this page are older than cutoff
+                        if cutoff and _all_listings_older_than_cutoff(page_listings, cutoff):
+                            logger.info(f"All {len(page_listings)} listings older than cutoff — stopping {label}")
+                            # Still process this last page before stopping
+                            _process_page(page_listings, stored_type, target_new_ids)
+                            total_price_changes += _detect_price_changes(page_listings, stored_type)
+                            break
 
-                        changes = []
-                        for l in page_listings:
-                            ref = l["reference_no"]
-                            if ref in current_prices and current_prices[ref] != l["price"] and current_prices[ref] > 0 and l["price"] > 0:
-                                changes.append({
-                                    "reference_no": ref,
-                                    "listing_type": stored_type,
-                                    "old_price": current_prices[ref],
-                                    "new_price": l["price"],
-                                })
-                                logger.info(f"Price change: {ref} — AED {current_prices[ref]:,.0f} → AED {l['price']:,.0f}")
-
-                        if changes:
-                            logger.info(f"Detected {len(changes)} price changes!")
-                            log_price_changes(changes)
-                            total_price_changes += len(changes)
-
-                        # Add scraped_at timestamp
-                        now = datetime.now(timezone.utc).isoformat()
-                        for l in page_listings:
-                            l["scraped_at"] = now
-
-                        # Upsert to pf_listings_v2
-                        logger.info(f"Upserting {len(page_listings)} listings...")
-                        upsert_listings(page_listings)
-
-                        # Sync to ddf_listings
-                        new_ids = sync_to_ddf(page_listings)
-                        all_new_ddf_ids.extend(new_ids)
+                        # Process page: upsert + sync
+                        _process_page(page_listings, stored_type, target_new_ids)
+                        total_price_changes += _detect_price_changes(page_listings, stored_type)
 
                     page_num += 1
                     time.sleep(random.uniform(3, 7))
@@ -562,8 +664,17 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                     time.sleep(random.uniform(5, 10))
                     continue
 
-            logger.info(f"✓ {label}: {len(target_listings)} listings scraped")
+            logger.info(f"✓ {label}: {len(target_listings)} listings scraped, {len(target_new_ids)} new DDF rows")
             all_listings.extend(target_listings)
+            all_new_ddf_ids.extend(target_new_ids)
+
+            # Track Dubai sale/rent for notification
+            if city == "Dubai":
+                if stored_type == "sale":
+                    dubai_sale_new += len(target_new_ids)
+                else:
+                    dubai_rent_new += len(target_new_ids)
+
             time.sleep(random.uniform(3, 7))
 
         browser.close()
@@ -583,10 +694,64 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
         f"Duration: {duration:.0f}s\n"
         f"Total listings scraped: {len(all_listings)}\n"
         f"New DDF rows: {len(all_new_ddf_ids)}\n"
+        f"Dubai Sale (new): {dubai_sale_new}\n"
+        f"Dubai Rent (new): {dubai_rent_new}\n"
         f"Dips computed: {total_dips}\n"
         f"Txn comparisons computed: {total_txns}\n"
         f"Price changes detected: {total_price_changes}"
     )
+
+    # Send Resend email notification
+    send_resend_notification(
+        total_scraped=len(all_listings),
+        new_ddf=len(all_new_ddf_ids),
+        dubai_sale=dubai_sale_new,
+        dubai_rent=dubai_rent_new,
+        total_dips=total_dips,
+        total_txns=total_txns,
+        price_changes=total_price_changes,
+        duration_s=duration,
+        target_count=len(targets),
+    )
+
+
+def _process_page(page_listings: list[dict], stored_type: str, new_ids_collector: list[int]):
+    """Process a page of listings: add timestamp, upsert, sync to DDF."""
+    now = datetime.now(timezone.utc).isoformat()
+    for l in page_listings:
+        l["scraped_at"] = now
+
+    # Upsert to pf_listings_v2
+    logger.info(f"Upserting {len(page_listings)} listings...")
+    upsert_listings(page_listings)
+
+    # Sync to ddf_listings
+    new_ids = sync_to_ddf(page_listings)
+    new_ids_collector.extend(new_ids)
+
+
+def _detect_price_changes(page_listings: list[dict], stored_type: str) -> int:
+    """Detect and log price changes for a page of listings. Returns count of changes."""
+    ref_nos = [l["reference_no"] for l in page_listings if l["reference_no"]]
+    current_prices = fetch_current_prices(ref_nos, stored_type)
+
+    changes = []
+    for l in page_listings:
+        ref = l["reference_no"]
+        if ref in current_prices and current_prices[ref] != l["price"] and current_prices[ref] > 0 and l["price"] > 0:
+            changes.append({
+                "reference_no": ref,
+                "listing_type": stored_type,
+                "old_price": current_prices[ref],
+                "new_price": l["price"],
+            })
+            logger.info(f"Price change: {ref} — AED {current_prices[ref]:,.0f} → AED {l['price']:,.0f}")
+
+    if changes:
+        logger.info(f"Detected {len(changes)} price changes!")
+        log_price_changes(changes)
+
+    return len(changes)
 
 
 if __name__ == "__main__":
@@ -608,10 +773,8 @@ if __name__ == "__main__":
             sys.exit(1)
         targets = BACKFILL_BATCHES[batch]
         logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, {max_pg} pages each ===")
-        run_scraper(max_pages=max_pg, custom_targets=targets)
-        logger.info("=== Backfill done. Running reset-txns and cleanup-duplicates ===")
-        reset_txns()
-        backfill_txns()
+        run_scraper(max_pages=max_pg, custom_targets=targets, smart_stop=False)
+        logger.info("=== Backfill done. Running cleanup-duplicates ===")
         cleanup_duplicates()
     elif args and args[0] == "--backfill":
         pages = int(args[1]) if len(args) > 1 else BACKFILL_DEFAULT_PAGES

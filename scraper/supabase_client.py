@@ -142,7 +142,7 @@ def upsert_listings(listings: list[dict]) -> None:
         return
 
     # Remove fields not in pf_listings_v2 schema
-    PF_EXCLUDE = {"bathrooms", "scraped_at", "ready_off_plan", "furnished"}
+    PF_EXCLUDE = {"bathrooms", "scraped_at", "ready_off_plan", "furnished", "city", "category"}
     listings = [{k: v for k, v in l.items() if k not in PF_EXCLUDE} for l in listings]
     listings = sanitize_listings(listings)
 
@@ -191,9 +191,34 @@ def compute_dup_hash(ref: str, source: str, price, url: str = "") -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def fetch_latest_listed_date(purpose: str, city: str) -> str:
+    """Fetch the most recent listed_date for a given purpose+city from ddf_listings."""
+    try:
+        resp = httpx.get(
+            DDF_URL,
+            headers=READ_HEADERS,
+            params={
+                "select": "listed_date",
+                "source": "eq.Property Finder",
+                "purpose": f"eq.{purpose}",
+                "city": f"eq.{city}",
+                "is_valid": "eq.true",
+                "listed_date": "not.is.null",
+                "order": "listed_date.desc",
+                "limit": "1",
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200 and resp.json():
+            return resp.json()[0].get("listed_date", "")
+    except Exception as e:
+        logger.warning(f"Failed to fetch latest listed_date: {e}")
+    return ""
+
+
 def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, tuple]:
-    """Fetch latest price_aed and date_listed per reference_no from ddf_listings.
-    Returns dict mapping reference_no -> (price, date_listed)."""
+    """Fetch latest price_aed and listed_date per reference_no from ddf_listings.
+    Returns dict mapping reference_no -> (price, listed_date)."""
     if not reference_nos:
         return {}
 
@@ -204,7 +229,7 @@ def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, tuple]:
             DDF_URL,
             headers=READ_HEADERS,
             params={
-                "select": "reference_no,price_aed,date_listed",
+                "select": "reference_no,price_aed,listed_date",
                 "source": "eq.Property Finder",
                 "reference_no": f"in.({refs_csv})",
                 "order": "scraped_at.desc",
@@ -216,7 +241,7 @@ def fetch_ddf_latest_prices(reference_nos: list[str]) -> dict[str, tuple]:
                 ref = row.get("reference_no", "")
                 if ref and ref not in prices:  # first = latest due to desc order
                     price = row.get("price_aed", 0)
-                    date = row.get("date_listed", "")
+                    date = row.get("listed_date", "")
                     if price:
                         prices[ref] = (float(price), date)
             logger.info(f"DDF: fetched {len(prices)} existing prices")
@@ -292,7 +317,6 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
         return []
 
     source = "Property Finder"
-    city = "Dubai"
 
     # Get existing DDF prices for listing_change calculation
     ref_nos = [l["reference_no"] for l in listings if l.get("reference_no")]
@@ -327,7 +351,7 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
 
         # Use PF's listed_date (full timestamp) instead of scrape date
         listed_date_raw = l.get("listed_date", "")
-        date_listed = listed_date_raw if listed_date_raw else (scraped_at[:10] if scraped_at else None)
+        listed_date = listed_date_raw if listed_date_raw else (scraped_at[:10] if scraped_at else None)
 
         # Use PF's last_refreshed_at for listing_change_date if we detected a price change
         last_refreshed = l.get("last_refreshed_at", "")
@@ -353,8 +377,9 @@ def sync_to_ddf(listings: list[dict]) -> list[int]:
             "url": url,
             "scraped_at": scraped_at,
             "source": source,
-            "city": city,
-            "date_listed": date_listed,
+            "city": l.get("city", "Dubai"),
+            "category": l.get("category", "Residential"),
+            "listed_date": listed_date,
             "is_valid": True,
             "dup_hash": dup_hash,
             "listing_change": listing_change,
@@ -411,15 +436,15 @@ def _update_existing_ddf_fields(ddf_rows: list[dict]) -> int:
         patch = {}
         ready = row.get("ready_off_plan")
         furnished = row.get("furnished")
-        date_listed = row.get("date_listed")
+        listed_date = row.get("listed_date")
         bedrooms = row.get("bedrooms")
 
         if ready:
             patch["ready_off_plan"] = ready
         if furnished:
             patch["furnished"] = furnished
-        if date_listed:
-            patch["date_listed"] = date_listed
+        if listed_date:
+            patch["listed_date"] = listed_date
         if bedrooms == "Studio":
             patch["bedrooms"] = "Studio"
 
@@ -445,7 +470,7 @@ def _update_existing_ddf_fields(ddf_rows: list[dict]) -> int:
             pass
 
     if updated:
-        logger.info(f"Updated existing fields (date_listed/bedrooms/ready/furnished) on {updated} rows")
+        logger.info(f"Updated existing fields (listed_date/bedrooms/ready/furnished) on {updated} rows")
     return updated
 
 
@@ -472,20 +497,20 @@ def compute_dip_for_row(row_id: int) -> bool:
         size = row.get("size_sqft")
         furnished = row.get("furnished")
         price = row.get("price_aed")
-        date_listed = row.get("date_listed")
+        listed_date = row.get("listed_date")
 
-        if not building or not price or bedrooms is None or not date_listed:
+        if not building or not price or bedrooms is None or not listed_date:
             return False
 
         # Find matching prior listings
         params = {
-            "select": "id,price_aed,date_listed,url,source,size_sqft,furnished,property_name",
+            "select": "id,price_aed,listed_date,url,source,size_sqft,furnished,property_name",
             "property_name": f"eq.{building}",
             "purpose": f"eq.{purpose}",
             "bedrooms": f"eq.{bedrooms}",
-            "date_listed": f"lt.{date_listed}",
+            "listed_date": f"lt.{listed_date}",
             "price_aed": "gt.0",
-            "order": "date_listed.desc",
+            "order": "listed_date.desc",
             "limit": "50",
         }
         if furnished:
@@ -529,7 +554,7 @@ def compute_dip_for_row(row_id: int) -> bool:
                 "dip_prev_price": prev_price,
                 "dip_prev_url": prev.get("url"),
                 "dip_prev_source": prev.get("source"),
-                "dip_prev_date": prev.get("date_listed"),
+                "dip_prev_date": prev.get("listed_date"),
                 "dip_prev_size": prev.get("size_sqft"),
                 "dip_prev_furnished": prev.get("furnished"),
             },
