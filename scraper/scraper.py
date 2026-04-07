@@ -170,6 +170,9 @@ def extract_listings(page_content: str, stored_type: str, property_type: str) ->
             loc_name = loc.get("full_name", "")[:80] if isinstance(loc, dict) else ""
             logger.info(f"First listing: ref={fp.get('reference')}, beds={fp.get('bedrooms')}, "
                         f"price={fp.get('price')}, size={fp.get('size')}, location={loc_name}")
+            logger.info(f"First listing date fields: listed_date={fp.get('listed_date')}, "
+                        f"last_refreshed_at={fp.get('last_refreshed_at')}, added_on={fp.get('added_on')}, "
+                        f"created_at={fp.get('created_at')}, updated_at={fp.get('updated_at')}")
 
         for wrapper in properties:
             try:
