@@ -608,9 +608,9 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                             failures += 1
                             continue
 
-                    # Check for 404 / no results page
-                    if "no properties found" in content.lower() or "page not found" in content.lower()[:3000]:
-                        logger.info(f"No results for {label} — skipping target")
+                    # Check for 404 page (title-based only — avoid false positives from JS bundles)
+                    if "page not found" in title.lower() or "404" in title:
+                        logger.info(f"404 for {label} — skipping target")
                         break
 
                     page_listings = extract_listings(content, stored_type, property_type)
