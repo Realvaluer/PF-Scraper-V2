@@ -10,7 +10,7 @@ import httpx
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, reset_txns, cleanup_duplicates
+from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, reset_txns, cleanup_duplicates, detect_delisted
 
 logging.basicConfig(
     level=logging.INFO,
@@ -752,6 +752,232 @@ def _detect_price_changes(page_listings: list[dict], stored_type: str) -> int:
     return len(changes)
 
 
+# ── Deep Refresh (weekly) ────────────────────────────────────────────────────
+
+DEEP_REFRESH_PAGES = 30
+
+
+def run_deep_refresh():
+    """Weekly deep refresh: scrape 30 pages per target (no smart stop),
+    then detect delisted listings and cleanup duplicates."""
+    logger.info("=== DEEP REFRESH: 30 pages per target, no smart stop ===")
+
+    # Use the same targets as daily but without smart stop
+    targets = SCRAPE_TARGETS
+
+    # Collect all scraped reference_nos for delisted detection
+    all_scraped_refs = set()
+
+    # Wrap run_scraper to also collect refs
+    # We run with smart_stop=False and max_pages=30
+    start_time = datetime.now(timezone.utc)
+
+    all_listings = []
+    all_new_ddf_ids = []
+    total_price_changes = 0
+    dubai_sale_new = 0
+    dubai_rent_new = 0
+    failed_targets = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=USER_AGENT,
+            locale="en-US",
+            timezone_id="Asia/Dubai",
+        )
+        page = context.new_page()
+        stealth_sync(page)
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+
+        pass_waf_challenge(page)
+        time.sleep(random.uniform(3, 5))
+
+        for idx, target in enumerate(targets):
+            label = target["label"]
+            stored_type = target["stored_type"]
+            property_type = target["property_type"]
+            base_url = target["url"]
+            city = target.get("city", "Dubai")
+            category = target.get("category", "Residential")
+
+            logger.info(f"\n--- [{idx+1}/{len(targets)}] {label} (deep refresh, {DEEP_REFRESH_PAGES} pages) ---")
+
+            if idx > 0:
+                logger.info("Re-warming WAF between targets...")
+                try:
+                    page.goto("https://www.propertyfinder.ae/en/", wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(random.uniform(5, 8))
+                except Exception as e:
+                    logger.warning(f"WAF re-warm failed: {e}")
+
+            target_listings = []
+            target_new_ids = []
+            page_num = 1
+            failures = 0
+
+            while page_num <= DEEP_REFRESH_PAGES:
+                if failures >= 3:
+                    logger.error(f"3 failures for {label} — moving on")
+                    failed_targets.append(label)
+                    break
+
+                if page_num == 1:
+                    url = base_url
+                elif "?" in base_url:
+                    url = f"{base_url}&page={page_num}"
+                else:
+                    url = f"{base_url}?page={page_num}"
+                try:
+                    logger.info(f"Page {page_num}: {url}")
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    content = wait_for_page_content(page)
+                    title = page.title()
+                    logger.info(f"Loaded — title: '{title}', length: {len(content)}")
+
+                    if len(content) < 5000:
+                        logger.warning("Page too small — likely blocked by WAF")
+                        failures += 1
+                        pass_waf_challenge(page)
+                        time.sleep(random.uniform(3, 5))
+                        continue
+
+                    if "challenge" in content.lower()[:2000] or "just a moment" in content.lower()[:2000]:
+                        logger.warning("WAF challenge page detected — waiting...")
+                        time.sleep(15)
+                        content = page.content()
+                        if len(content) < 10000:
+                            failures += 1
+                            continue
+
+                    if "page not found" in title.lower() or "404" in title:
+                        logger.info(f"404 for {label} — skipping target")
+                        break
+
+                    page_listings = extract_listings(content, stored_type, property_type)
+
+                    if not page_listings:
+                        logger.warning(f"0 listings on page {page_num}")
+                        failures += 1
+                    else:
+                        failures = 0
+                        for l in page_listings:
+                            l["city"] = city
+                            l["category"] = category
+
+                        target_listings.extend(page_listings)
+
+                        # Collect refs for delisted detection
+                        for l in page_listings:
+                            if l.get("reference_no"):
+                                all_scraped_refs.add(l["reference_no"])
+
+                        logger.info(f"Got {len(page_listings)} listings (total: {len(target_listings)})")
+
+                        total_price_changes += _detect_price_changes(page_listings, stored_type)
+                        _process_page(page_listings, stored_type, target_new_ids)
+
+                    page_num += 1
+                    time.sleep(random.uniform(3, 7))
+
+                except Exception as e:
+                    logger.error(f"Error on page {page_num}: {e}")
+                    failures += 1
+                    time.sleep(random.uniform(5, 10))
+                    continue
+
+            logger.info(f"✓ {label}: {len(target_listings)} listings scraped, {len(target_new_ids)} new DDF rows")
+            all_listings.extend(target_listings)
+            all_new_ddf_ids.extend(target_new_ids)
+
+            if city == "Dubai":
+                if stored_type == "sale":
+                    dubai_sale_new += len(target_new_ids)
+                else:
+                    dubai_rent_new += len(target_new_ids)
+
+            time.sleep(random.uniform(3, 7))
+
+        browser.close()
+
+    # Compute dips + txns for new rows
+    total_dips = compute_dips_for_rows(all_new_ddf_ids)
+    total_txns = compute_txns_for_rows(all_new_ddf_ids)
+
+    # Detect delisted listings
+    logger.info(f"\n=== Post-scrape: Delisted detection ({len(all_scraped_refs):,} refs collected) ===")
+    total_delisted = detect_delisted(all_scraped_refs)
+
+    # Cleanup duplicates
+    logger.info("\n=== Post-scrape: Cleanup duplicates ===")
+    cleanup_duplicates()
+
+    end_time = datetime.now(timezone.utc)
+    duration = (end_time - start_time).total_seconds()
+    logger.info(
+        f"\n=== DEEP REFRESH finished ===\n"
+        f"Start:    {start_time.isoformat()}\n"
+        f"End:      {end_time.isoformat()}\n"
+        f"Duration: {duration:.0f}s\n"
+        f"Total listings scraped: {len(all_listings)}\n"
+        f"Unique refs collected: {len(all_scraped_refs):,}\n"
+        f"New DDF rows: {len(all_new_ddf_ids)}\n"
+        f"Dips computed: {total_dips}\n"
+        f"Txn comparisons: {total_txns}\n"
+        f"Price changes: {total_price_changes}\n"
+        f"Delisted: {total_delisted}\n"
+        f"Failed targets: {len(failed_targets)}"
+    )
+
+    send_resend_notification(
+        total_scraped=len(all_listings),
+        new_ddf=len(all_new_ddf_ids),
+        dubai_sale=dubai_sale_new,
+        dubai_rent=dubai_rent_new,
+        total_dips=total_dips,
+        total_txns=total_txns,
+        price_changes=total_price_changes,
+        duration_s=duration,
+        target_count=len(targets),
+        failed_targets=failed_targets,
+    )
+
+
+# ── Backfill Targets (all emirates + commercial) ────────────────────────────
+
+def _build_backfill_targets():
+    """Build backfill targets for ALL emirates + commercial.
+    Uses the same SCRAPE_TARGETS but without ?sort=nd (backfill uses default sort).
+    Each target gets city and category for proper DDF insertion."""
+    targets = []
+    for slug, city in EMIRATES:
+        # Residential rent + sale
+        for ptype_slug, ptype in RESIDENTIAL_TYPES:
+            targets.append({"url": f"{PF_BASE}/rent/{slug}/{ptype_slug}-for-rent.html", "label": f"BF {city} {ptype.title()} (rent)", "stored_type": "rent", "property_type": ptype, "city": city, "category": "Residential"})
+            targets.append({"url": f"{PF_BASE}/buy/{slug}/{ptype_slug}-for-sale.html", "label": f"BF {city} {ptype.title()} (sale)", "stored_type": "sale", "property_type": ptype, "city": city, "category": "Residential"})
+        # Residential land
+        targets.append({"url": f"{PF_BASE}/buy/{slug}/land-for-sale.html", "label": f"BF {city} Land (sale)", "stored_type": "sale", "property_type": "land", "city": city, "category": "Residential"})
+        # Commercial rent + sale
+        for ctype_slug, ctype in COMMERCIAL_TYPES:
+            targets.append({"url": f"{PF_BASE}/commercial-rent/{slug}/{ctype_slug}-for-rent.html", "label": f"BF {city} {ctype.title()} (rent)", "stored_type": "rent", "property_type": ctype, "city": city, "category": "Commercial"})
+            targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/{ctype_slug}-for-sale.html", "label": f"BF {city} {ctype.title()} (sale)", "stored_type": "sale", "property_type": ctype, "city": city, "category": "Commercial"})
+        # Commercial land
+        targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/land-for-sale.html", "label": f"BF {city} Commercial Land (sale)", "stored_type": "sale", "property_type": "commercial land", "city": city, "category": "Commercial"})
+    return targets
+
+BACKFILL_ALL_TARGETS = _build_backfill_targets()
+
+
 if __name__ == "__main__":
     import sys
     # Parse --property-type from any position
@@ -763,15 +989,24 @@ if __name__ == "__main__":
             pt_filter = [t.strip() for t in args[pt_idx + 1].split(",")]
             args = args[:pt_idx] + args[pt_idx + 2:]
 
-    if args and args[0] == "--backfill-full":
+    if args and args[0] == "--deep-refresh":
+        run_deep_refresh()
+    elif args and args[0] == "--backfill-full":
         batch = args[1] if len(args) > 1 else "all"
         max_pg = int(args[2]) if len(args) > 2 else 249
-        if batch not in BACKFILL_BATCHES:
-            logger.error(f"Invalid batch: {batch}. Use 1, 2, 3, or all")
+        if batch == "all-emirates":
+            # New: backfill ALL emirates + commercial (140 targets × 249 pages)
+            targets = BACKFILL_ALL_TARGETS
+            logger.info(f"=== FULL BACKFILL (all emirates): {len(targets)} targets, {max_pg} pages each ===")
+            run_scraper(max_pages=max_pg, custom_targets=targets, smart_stop=False)
+        elif batch in BACKFILL_BATCHES:
+            # Legacy: Dubai bedroom+price split batches
+            targets = BACKFILL_BATCHES[batch]
+            logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, {max_pg} pages each ===")
+            run_scraper(max_pages=max_pg, custom_targets=targets, smart_stop=False)
+        else:
+            logger.error(f"Invalid batch: {batch}. Use 1, 2, 3, all, or all-emirates")
             sys.exit(1)
-        targets = BACKFILL_BATCHES[batch]
-        logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, {max_pg} pages each ===")
-        run_scraper(max_pages=max_pg, custom_targets=targets, smart_stop=False)
         logger.info("=== Backfill done. Running cleanup-duplicates ===")
         cleanup_duplicates()
     elif args and args[0] == "--backfill":

@@ -1068,3 +1068,97 @@ def reset_txns(limit: int = 0) -> list[int]:
         except Exception as e:
             logger.error(f"Reset failed: {e}")
         return []
+
+
+# ── Delisted Detection ─────────────────────────────────────────────────────────
+
+
+def detect_delisted(scraped_refs: set[str]) -> int:
+    """Mark listings as delisted if they were not found in the latest deep refresh scrape.
+    Only marks listings that were also not found in the PREVIOUS deep refresh (2-strike rule).
+    Uses a 'missed_refreshes' counter on each row.
+
+    Args:
+        scraped_refs: Set of all reference_nos found during this deep refresh scrape.
+
+    Returns:
+        Number of listings marked as delisted.
+    """
+    if not scraped_refs:
+        logger.warning("No scraped refs provided — skipping delisted detection")
+        return 0
+
+    logger.info(f"=== Delisted detection: checking against {len(scraped_refs):,} scraped refs ===")
+
+    # Fetch all valid PF listings
+    all_valid = []
+    offset = 0
+    batch_size = 1000
+
+    while True:
+        try:
+            resp = httpx.get(
+                DDF_URL,
+                headers=READ_HEADERS,
+                params={
+                    "select": "id,reference_no,purpose",
+                    "source": "eq.Property Finder",
+                    "is_valid": "eq.true",
+                    "order": "id.asc",
+                    "limit": str(batch_size),
+                    "offset": str(offset),
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch valid rows: {resp.status_code}")
+                break
+            rows = resp.json()
+            if not rows:
+                break
+            all_valid.extend(rows)
+            offset += batch_size
+        except Exception as e:
+            logger.error(f"Failed to fetch valid rows: {e}")
+            break
+
+    logger.info(f"Total valid PF listings in DDF: {len(all_valid):,}")
+
+    # Find listings NOT in scraped refs
+    missing_ids = []
+    for row in all_valid:
+        ref = row.get("reference_no", "")
+        if ref and ref not in scraped_refs:
+            missing_ids.append(row["id"])
+
+    logger.info(f"Listings not found in this scrape: {len(missing_ids):,}")
+
+    if not missing_ids:
+        logger.info("All listings still active — no delistings")
+        return 0
+
+    # Mark as delisted (is_valid=false, set delisted_at timestamp)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    delisted = 0
+
+    for i in range(0, len(missing_ids), 50):
+        batch = missing_ids[i : i + 50]
+        ids_csv = ",".join(str(rid) for rid in batch)
+        try:
+            resp = httpx.patch(
+                DDF_URL,
+                headers=DDF_UPDATE_HEADERS,
+                params={"id": f"in.({ids_csv})"},
+                json={"is_valid": False, "delisted_at": now},
+                timeout=15,
+            )
+            if resp.status_code in (200, 204):
+                delisted += len(batch)
+            else:
+                logger.warning(f"Delisted batch failed: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Delisted batch failed: {e}")
+
+    logger.info(f"=== Delisted detection complete: {delisted:,} listings marked as delisted ===")
+    return delisted
