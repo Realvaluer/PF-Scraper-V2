@@ -4,13 +4,13 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import httpx
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, reset_txns, cleanup_duplicates, fetch_latest_listed_date
+from .supabase_client import upsert_listings, fetch_current_prices, log_price_changes, sync_to_ddf, compute_dips_for_rows, backfill_dips, compute_txns_for_rows, backfill_txns, reset_txns, cleanup_duplicates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,18 +54,18 @@ COMMERCIAL_TYPES = [
 def _build_targets():
     targets = []
     for slug, city in EMIRATES:
-        # Residential rent + sale
+        # Residential rent + sale (sort=nd for newest first)
         for ptype_slug, ptype in RESIDENTIAL_TYPES:
-            targets.append({"url": f"{PF_BASE}/rent/{slug}/{ptype_slug}-for-rent.html", "label": f"{city} {ptype.title()} (rent)", "stored_type": "rent", "property_type": ptype, "city": city, "category": "Residential"})
-            targets.append({"url": f"{PF_BASE}/buy/{slug}/{ptype_slug}-for-sale.html", "label": f"{city} {ptype.title()} (sale)", "stored_type": "sale", "property_type": ptype, "city": city, "category": "Residential"})
+            targets.append({"url": f"{PF_BASE}/rent/{slug}/{ptype_slug}-for-rent.html?sort=nd", "label": f"{city} {ptype.title()} (rent)", "stored_type": "rent", "property_type": ptype, "city": city, "category": "Residential"})
+            targets.append({"url": f"{PF_BASE}/buy/{slug}/{ptype_slug}-for-sale.html?sort=nd", "label": f"{city} {ptype.title()} (sale)", "stored_type": "sale", "property_type": ptype, "city": city, "category": "Residential"})
         # Residential land (sale only)
-        targets.append({"url": f"{PF_BASE}/buy/{slug}/land-for-sale.html", "label": f"{city} Land (sale)", "stored_type": "sale", "property_type": "land", "city": city, "category": "Residential"})
+        targets.append({"url": f"{PF_BASE}/buy/{slug}/land-for-sale.html?sort=nd", "label": f"{city} Land (sale)", "stored_type": "sale", "property_type": "land", "city": city, "category": "Residential"})
         # Commercial rent + sale (PF uses /commercial-rent/ and /commercial-buy/ paths)
         for ctype_slug, ctype in COMMERCIAL_TYPES:
-            targets.append({"url": f"{PF_BASE}/commercial-rent/{slug}/{ctype_slug}-for-rent.html", "label": f"{city} {ctype.title()} (rent)", "stored_type": "rent", "property_type": ctype, "city": city, "category": "Commercial"})
-            targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/{ctype_slug}-for-sale.html", "label": f"{city} {ctype.title()} (sale)", "stored_type": "sale", "property_type": ctype, "city": city, "category": "Commercial"})
+            targets.append({"url": f"{PF_BASE}/commercial-rent/{slug}/{ctype_slug}-for-rent.html?sort=nd", "label": f"{city} {ctype.title()} (rent)", "stored_type": "rent", "property_type": ctype, "city": city, "category": "Commercial"})
+            targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/{ctype_slug}-for-sale.html?sort=nd", "label": f"{city} {ctype.title()} (sale)", "stored_type": "sale", "property_type": ctype, "city": city, "category": "Commercial"})
         # Commercial land (sale only)
-        targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/land-for-sale.html", "label": f"{city} Commercial Land (sale)", "stored_type": "sale", "property_type": "commercial land", "city": city, "category": "Commercial"})
+        targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/land-for-sale.html?sort=nd", "label": f"{city} Commercial Land (sale)", "stored_type": "sale", "property_type": "commercial land", "city": city, "category": "Commercial"})
     return targets
 
 SCRAPE_TARGETS = _build_targets()
@@ -397,46 +397,12 @@ def pass_waf_challenge(page) -> bool:
         return False
 
 
-def _get_cutoff_for_target(target: dict) -> str | None:
-    """Get the smart cutoff timestamp for a target (latest listed_date - 5 min).
-    Returns ISO timestamp string, or None if no prior data exists (scrape all pages)."""
-    purpose = "Rent" if target["stored_type"] == "rent" else "Sale"
-    city = target.get("city", "Dubai")
+ZERO_PAGE_STOP = 3  # Stop target after N consecutive pages with 0 new DDF rows
 
-    latest = fetch_latest_listed_date(purpose, city)
-    if not latest:
-        logger.info(f"No prior listed_date for {purpose}/{city} — will scrape up to page limit")
-        return None
-
-    try:
-        # Parse ISO timestamp — handle both "Z" and "+00:00" formats
-        ts = latest.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts)
-        cutoff = dt - timedelta(minutes=5)
-        cutoff_str = cutoff.isoformat()
-        logger.info(f"Smart cutoff for {purpose}/{city}: {cutoff_str} (latest={latest})")
-        return cutoff_str
-    except Exception as e:
-        logger.warning(f"Failed to parse latest listed_date '{latest}': {e}")
-        return None
-
-
-def _all_listings_older_than_cutoff(page_listings: list[dict], cutoff: str) -> bool:
-    """Check if ALL listings on a page have listed_date older than the cutoff."""
-    if not page_listings:
-        return False
-    for l in page_listings:
-        ld = l.get("listed_date", "")
-        if not ld:
-            # No date — can't determine, assume it's new
-            return False
-        try:
-            ts = ld.replace("Z", "+00:00")
-            if ts >= cutoff:
-                return False  # At least one listing is newer than cutoff
-        except Exception:
-            return False
-    return True
+# Red flag thresholds (per 8h cron run)
+MIN_DUBAI_SALE = 3
+MIN_DUBAI_RENT = 3
+MIN_TOTAL_NEW = 20
 
 
 def send_resend_notification(
@@ -449,6 +415,7 @@ def send_resend_notification(
     price_changes: int,
     duration_s: float,
     target_count: int,
+    failed_targets: list[str] = None,
 ):
     """Send email notification via Resend after scrape completes."""
     resend_api_key = os.environ.get("RESEND_API_KEY", "")
@@ -460,10 +427,33 @@ def send_resend_notification(
     mins = int(duration_s // 60)
     secs = int(duration_s % 60)
 
-    subject = f"PF Scraper: {new_ddf} new listings ({dubai_sale} sale, {dubai_rent} rent)"
+    # Red flag checks
+    alerts = []
+    if dubai_sale < MIN_DUBAI_SALE:
+        alerts.append(f"Dubai Sale only {dubai_sale} new rows (expected {MIN_DUBAI_SALE}+). Check PF or WAF blocking.")
+    if dubai_rent < MIN_DUBAI_RENT:
+        alerts.append(f"Dubai Rent only {dubai_rent} new rows (expected {MIN_DUBAI_RENT}+). Check PF or WAF blocking.")
+    if new_ddf < MIN_TOTAL_NEW:
+        alerts.append(f"Total new rows only {new_ddf} (expected {MIN_TOTAL_NEW}+). Possible scraping issue.")
+    if failed_targets:
+        alerts.append(f"{len(failed_targets)} targets failed (WAF/404): {', '.join(failed_targets[:10])}")
+
+    is_alert = len(alerts) > 0
+    subject = f"{'⚠️ ALERT: ' if is_alert else ''}PF Scraper: {new_ddf} new listings ({dubai_sale} sale, {dubai_rent} rent)"
+
+    alert_html = ""
+    if alerts:
+        alert_items = "".join(f"<li style='color:#c00;'>{a}</li>" for a in alerts)
+        alert_html = f"""
+        <h3 style="color:#c00;">Red Flags</h3>
+        <ul>{alert_items}</ul>
+        <p><b>Suggested action:</b> Check Railway deploy logs for errors. Verify PF is accessible. Re-run manually if needed.</p>
+        <hr>
+        """
 
     html_body = f"""
     <h2>PF Scraper V2 — Run Complete</h2>
+    {alert_html}
     <table style="border-collapse:collapse; font-family:Arial,sans-serif;">
       <tr><td style="padding:4px 12px;"><b>Targets scraped</b></td><td>{target_count}</td></tr>
       <tr><td style="padding:4px 12px;"><b>Total listings scraped</b></td><td>{total_scraped:,}</td></tr>
@@ -511,9 +501,9 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
     all_listings = []
     all_new_ddf_ids = []
     total_price_changes = 0
-    # Track Dubai sale/rent counts for notification
     dubai_sale_new = 0
     dubai_rent_new = 0
+    failed_targets = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -550,12 +540,7 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
             city = target.get("city", "Dubai")
             category = target.get("category", "Residential")
 
-            # Smart stop: get cutoff timestamp for this target
-            cutoff = None
-            if smart_stop:
-                cutoff = _get_cutoff_for_target(target)
-
-            logger.info(f"\n--- [{idx+1}/{len(targets)}] {label} (max {pages} pages, cutoff={cutoff or 'none'}) ---")
+            logger.info(f"\n--- [{idx+1}/{len(targets)}] {label} (max {pages} pages, smart_stop={smart_stop}) ---")
 
             # Re-warm WAF between targets (not on first one)
             if idx > 0:
@@ -570,10 +555,12 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
             target_new_ids = []
             page_num = 1
             failures = 0
+            consecutive_zero_pages = 0  # Track pages with 0 new DDF rows
 
             while page_num <= pages:
                 if failures >= 3:
                     logger.error(f"3 failures for {label} — moving on")
+                    failed_targets.append(label)
                     break
 
                 if page_num == 1:
@@ -608,7 +595,7 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                             failures += 1
                             continue
 
-                    # Check for 404 page (title-based only — avoid false positives from JS bundles)
+                    # Check for 404 page (title-based only)
                     if "page not found" in title.lower() or "404" in title:
                         logger.info(f"404 for {label} — skipping target")
                         break
@@ -643,17 +630,26 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                                 f"listed_date={first.get('listed_date','')[:20]}"
                             )
 
-                        # Smart stop: check if all listings on this page are older than cutoff
-                        if cutoff and _all_listings_older_than_cutoff(page_listings, cutoff):
-                            logger.info(f"All {len(page_listings)} listings older than cutoff — stopping {label}")
-                            # Still process this last page before stopping
-                            _process_page(page_listings, stored_type, target_new_ids)
-                            total_price_changes += _detect_price_changes(page_listings, stored_type)
-                            break
-
-                        # Process page: upsert + sync
-                        _process_page(page_listings, stored_type, target_new_ids)
+                        # Detect price changes BEFORE processing
                         total_price_changes += _detect_price_changes(page_listings, stored_type)
+
+                        # Process page: upsert + sync to DDF
+                        ids_before = len(target_new_ids)
+                        _process_page(page_listings, stored_type, target_new_ids)
+                        new_on_this_page = len(target_new_ids) - ids_before
+
+                        logger.info(f"Page {page_num}: {new_on_this_page} new DDF rows from {len(page_listings)} listings")
+
+                        # Smart stop: 3 consecutive pages with 0 new rows → stop
+                        if smart_stop:
+                            if new_on_this_page == 0:
+                                consecutive_zero_pages += 1
+                                logger.info(f"Zero new rows ({consecutive_zero_pages}/{ZERO_PAGE_STOP} consecutive)")
+                                if consecutive_zero_pages >= ZERO_PAGE_STOP:
+                                    logger.info(f"Stopping {label}: {ZERO_PAGE_STOP} consecutive pages with 0 new rows")
+                                    break
+                            else:
+                                consecutive_zero_pages = 0  # Reset counter
 
                     page_num += 1
                     time.sleep(random.uniform(3, 7))
@@ -698,10 +694,11 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
         f"Dubai Rent (new): {dubai_rent_new}\n"
         f"Dips computed: {total_dips}\n"
         f"Txn comparisons computed: {total_txns}\n"
-        f"Price changes detected: {total_price_changes}"
+        f"Price changes detected: {total_price_changes}\n"
+        f"Failed targets: {len(failed_targets)}"
     )
 
-    # Send Resend email notification
+    # Send Resend email notification (with red flag alerts)
     send_resend_notification(
         total_scraped=len(all_listings),
         new_ddf=len(all_new_ddf_ids),
@@ -712,6 +709,7 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
         price_changes=total_price_changes,
         duration_s=duration,
         target_count=len(targets),
+        failed_targets=failed_targets,
     )
 
 
