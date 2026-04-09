@@ -142,7 +142,7 @@ def upsert_listings(listings: list[dict]) -> None:
         return
 
     # Remove fields not in pf_listings_v2 schema
-    PF_EXCLUDE = {"bathrooms", "scraped_at", "ready_off_plan", "furnished", "city", "category"}
+    PF_EXCLUDE = {"bathrooms", "scraped_at", "ready_off_plan", "furnished", "city", "category", "last_refreshed_at"}
     listings = [{k: v for k, v in l.items() if k not in PF_EXCLUDE} for l in listings]
     listings = sanitize_listings(listings)
 
