@@ -667,6 +667,11 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
     # Compute transaction comparisons for newly inserted DDF rows
     total_txns = compute_txns_for_rows(all_new_ddf_ids)
 
+    # Backfill any rows from previous runs that are missing dips/txns
+    logger.info("\n=== Backfill check: filling any NULL dip/txn rows from prior runs ===")
+    backfill_dips()
+    backfill_txns()
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.info(
