@@ -499,6 +499,8 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
     all_listings = []
     all_new_ddf_ids = []
     total_price_changes = 0
+    total_dips = 0
+    total_txns = 0
     dubai_sale_new = 0
     dubai_rent_new = 0
     failed_targets = []
@@ -650,6 +652,14 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
             all_listings.extend(target_listings)
             all_new_ddf_ids.extend(target_new_ids)
 
+            # Compute dips + txns for this target immediately
+            if target_new_ids:
+                target_dips = compute_dips_for_rows(target_new_ids)
+                target_txns = compute_txns_for_rows(target_new_ids)
+                total_dips += target_dips
+                total_txns += target_txns
+                logger.info(f"  Dips: {target_dips}, Txns: {target_txns} for {label}")
+
             # Track Dubai sale/rent for notification
             if city == "Dubai":
                 if stored_type == "sale":
@@ -660,12 +670,6 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
             time.sleep(random.uniform(3, 7))
 
         browser.close()
-
-    # Compute dips for all newly inserted DDF rows
-    total_dips = compute_dips_for_rows(all_new_ddf_ids)
-
-    # Compute transaction comparisons for newly inserted DDF rows
-    total_txns = compute_txns_for_rows(all_new_ddf_ids)
 
     # Backfill any rows from previous runs that are missing dips/txns
     logger.info("\n=== Backfill check: filling any NULL dip/txn rows from prior runs ===")
@@ -770,6 +774,8 @@ def run_deep_refresh():
     all_listings = []
     all_new_ddf_ids = []
     total_price_changes = 0
+    total_dips = 0
+    total_txns = 0
     dubai_sale_new = 0
     dubai_rent_new = 0
     failed_targets = []
@@ -895,6 +901,14 @@ def run_deep_refresh():
             all_listings.extend(target_listings)
             all_new_ddf_ids.extend(target_new_ids)
 
+            # Compute dips + txns for this target immediately
+            if target_new_ids:
+                target_dips = compute_dips_for_rows(target_new_ids)
+                target_txns = compute_txns_for_rows(target_new_ids)
+                total_dips += target_dips
+                total_txns += target_txns
+                logger.info(f"  Dips: {target_dips}, Txns: {target_txns} for {label}")
+
             if city == "Dubai":
                 if stored_type == "sale":
                     dubai_sale_new += len(target_new_ids)
@@ -904,10 +918,6 @@ def run_deep_refresh():
             time.sleep(random.uniform(3, 7))
 
         browser.close()
-
-    # Compute dips + txns for new rows
-    total_dips = compute_dips_for_rows(all_new_ddf_ids)
-    total_txns = compute_txns_for_rows(all_new_ddf_ids)
 
     # Backfill any rows missing dips/txns
     logger.info("\n=== Backfill check: filling any NULL dip/txn rows ===")
