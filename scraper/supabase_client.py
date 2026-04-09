@@ -521,10 +521,10 @@ def compute_dip_for_row(row_id: int) -> bool:
             return False
         matches = resp2.json() or []
 
-        # Filter by size ±10%
+        # Filter by size ±15%
         if size and int(size) > 0:
-            lo = int(size) * 0.9
-            hi = int(size) * 1.1
+            lo = int(size) * 0.85
+            hi = int(size) * 1.15
             size_matches = [m for m in matches if m.get("size_sqft") and lo <= int(m["size_sqft"]) <= hi]
             if size_matches:
                 matches = size_matches
@@ -906,10 +906,10 @@ def compute_txn_for_row(row_id: int) -> bool:
         # Filter: fuzzy community match
         matches = [m for m in matches if _community_fuzzy_match(community, m.get("community_name", ""))]
 
-        # Filter by size ±10%
+        # Filter by size ±15%
         if size and int(size) > 0:
-            lo = int(size) * 0.9
-            hi = int(size) * 1.1
+            lo = int(size) * 0.85
+            hi = int(size) * 1.15
             size_matches = [m for m in matches if m.get("size_sqft") and lo <= float(m["size_sqft"]) <= hi]
             if size_matches:
                 matches = size_matches
