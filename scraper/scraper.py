@@ -672,6 +672,10 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
     backfill_dips()
     backfill_txns()
 
+    # Cleanup duplicates
+    logger.info("\n=== Post-scrape: Cleanup duplicates ===")
+    cleanup_duplicates()
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.info(
@@ -905,6 +909,11 @@ def run_deep_refresh():
     total_dips = compute_dips_for_rows(all_new_ddf_ids)
     total_txns = compute_txns_for_rows(all_new_ddf_ids)
 
+    # Backfill any rows missing dips/txns
+    logger.info("\n=== Backfill check: filling any NULL dip/txn rows ===")
+    backfill_dips()
+    backfill_txns()
+
     # Detect delisted listings
     logger.info(f"\n=== Post-scrape: Delisted detection ({len(all_scraped_refs):,} refs collected) ===")
     total_delisted = detect_delisted(all_scraped_refs)
@@ -998,7 +1007,9 @@ if __name__ == "__main__":
         else:
             logger.error(f"Invalid batch: {batch}. Use 1, 2, 3, all, or all-emirates")
             sys.exit(1)
-        logger.info("=== Backfill done. Running cleanup-duplicates ===")
+        logger.info("=== Backfill done. Final cleanup + backfill NULL dips/txns ===")
+        backfill_dips()
+        backfill_txns()
         cleanup_duplicates()
     elif args and args[0] == "--backfill":
         pages = int(args[1]) if len(args) > 1 else BACKFILL_DEFAULT_PAGES
