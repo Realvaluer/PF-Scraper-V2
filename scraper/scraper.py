@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_PAGES_SAFETY_NET = 30
+MAX_PAGES_PER_TARGET = 5
 BACKFILL_DEFAULT_PAGES = 50
 
 # ── Helper to generate targets ────────────────────────────────────────────────
@@ -54,18 +54,18 @@ COMMERCIAL_TYPES = [
 def _build_targets():
     targets = []
     for slug, city in EMIRATES:
-        # Residential rent + sale (sort=nd for newest first)
+        # Residential rent + sale
         for ptype_slug, ptype in RESIDENTIAL_TYPES:
-            targets.append({"url": f"{PF_BASE}/rent/{slug}/{ptype_slug}-for-rent.html?sort=nd", "label": f"{city} {ptype.title()} (rent)", "stored_type": "rent", "property_type": ptype, "city": city, "category": "Residential"})
-            targets.append({"url": f"{PF_BASE}/buy/{slug}/{ptype_slug}-for-sale.html?sort=nd", "label": f"{city} {ptype.title()} (sale)", "stored_type": "sale", "property_type": ptype, "city": city, "category": "Residential"})
+            targets.append({"url": f"{PF_BASE}/rent/{slug}/{ptype_slug}-for-rent.html", "label": f"{city} {ptype.title()} (rent)", "stored_type": "rent", "property_type": ptype, "city": city, "category": "Residential"})
+            targets.append({"url": f"{PF_BASE}/buy/{slug}/{ptype_slug}-for-sale.html", "label": f"{city} {ptype.title()} (sale)", "stored_type": "sale", "property_type": ptype, "city": city, "category": "Residential"})
         # Residential land (sale only)
-        targets.append({"url": f"{PF_BASE}/buy/{slug}/land-for-sale.html?sort=nd", "label": f"{city} Land (sale)", "stored_type": "sale", "property_type": "land", "city": city, "category": "Residential"})
+        targets.append({"url": f"{PF_BASE}/buy/{slug}/land-for-sale.html", "label": f"{city} Land (sale)", "stored_type": "sale", "property_type": "land", "city": city, "category": "Residential"})
         # Commercial rent + sale (PF uses /commercial-rent/ and /commercial-buy/ paths)
         for ctype_slug, ctype in COMMERCIAL_TYPES:
-            targets.append({"url": f"{PF_BASE}/commercial-rent/{slug}/{ctype_slug}-for-rent.html?sort=nd", "label": f"{city} {ctype.title()} (rent)", "stored_type": "rent", "property_type": ctype, "city": city, "category": "Commercial"})
-            targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/{ctype_slug}-for-sale.html?sort=nd", "label": f"{city} {ctype.title()} (sale)", "stored_type": "sale", "property_type": ctype, "city": city, "category": "Commercial"})
+            targets.append({"url": f"{PF_BASE}/commercial-rent/{slug}/{ctype_slug}-for-rent.html", "label": f"{city} {ctype.title()} (rent)", "stored_type": "rent", "property_type": ctype, "city": city, "category": "Commercial"})
+            targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/{ctype_slug}-for-sale.html", "label": f"{city} {ctype.title()} (sale)", "stored_type": "sale", "property_type": ctype, "city": city, "category": "Commercial"})
         # Commercial land (sale only)
-        targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/land-for-sale.html?sort=nd", "label": f"{city} Commercial Land (sale)", "stored_type": "sale", "property_type": "commercial land", "city": city, "category": "Commercial"})
+        targets.append({"url": f"{PF_BASE}/commercial-buy/{slug}/land-for-sale.html", "label": f"{city} Commercial Land (sale)", "stored_type": "sale", "property_type": "commercial land", "city": city, "category": "Commercial"})
     return targets
 
 SCRAPE_TARGETS = _build_targets()
@@ -397,8 +397,6 @@ def pass_waf_challenge(page) -> bool:
         return False
 
 
-ZERO_PAGE_STOP = 3  # Stop target after N consecutive pages with 0 new DDF rows
-
 # Red flag thresholds (per 8h cron run)
 MIN_DUBAI_SALE = 3
 MIN_DUBAI_RENT = 3
@@ -490,13 +488,13 @@ def send_resend_notification(
         logger.warning(f"Resend notification failed: {e}")
 
 
-def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_targets: list[dict] = None, smart_stop: bool = True):
-    pages = max_pages or MAX_PAGES_SAFETY_NET
+def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_targets: list[dict] = None):
+    pages = max_pages or MAX_PAGES_PER_TARGET
     targets = custom_targets or SCRAPE_TARGETS
     if property_types and not custom_targets:
         targets = [t for t in targets if t["property_type"] in property_types]
     start_time = datetime.now(timezone.utc)
-    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets, smart_stop={smart_stop}) ===")
+    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets) ===")
 
     all_listings = []
     all_new_ddf_ids = []
@@ -540,7 +538,7 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
             city = target.get("city", "Dubai")
             category = target.get("category", "Residential")
 
-            logger.info(f"\n--- [{idx+1}/{len(targets)}] {label} (max {pages} pages, smart_stop={smart_stop}) ---")
+            logger.info(f"\n--- [{idx+1}/{len(targets)}] {label} (max {pages} pages) ---")
 
             # Re-warm WAF between targets (not on first one)
             if idx > 0:
@@ -555,7 +553,6 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
             target_new_ids = []
             page_num = 1
             failures = 0
-            consecutive_zero_pages = 0  # Track pages with 0 new DDF rows
 
             while page_num <= pages:
                 if failures >= 3:
@@ -639,17 +636,6 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
                         new_on_this_page = len(target_new_ids) - ids_before
 
                         logger.info(f"Page {page_num}: {new_on_this_page} new DDF rows from {len(page_listings)} listings")
-
-                        # Smart stop: 3 consecutive pages with 0 new rows → stop
-                        if smart_stop:
-                            if new_on_this_page == 0:
-                                consecutive_zero_pages += 1
-                                logger.info(f"Zero new rows ({consecutive_zero_pages}/{ZERO_PAGE_STOP} consecutive)")
-                                if consecutive_zero_pages >= ZERO_PAGE_STOP:
-                                    logger.info(f"Stopping {label}: {ZERO_PAGE_STOP} consecutive pages with 0 new rows")
-                                    break
-                            else:
-                                consecutive_zero_pages = 0  # Reset counter
 
                     page_num += 1
                     time.sleep(random.uniform(3, 7))
@@ -769,7 +755,7 @@ def run_deep_refresh():
     all_scraped_refs = set()
 
     # Wrap run_scraper to also collect refs
-    # We run with smart_stop=False and max_pages=30
+    # Run with max_pages=30 (deep refresh)
     start_time = datetime.now(timezone.utc)
 
     all_listings = []
@@ -957,7 +943,7 @@ def run_deep_refresh():
 
 def _build_backfill_targets():
     """Build backfill targets for ALL emirates + commercial.
-    Uses the same SCRAPE_TARGETS but without ?sort=nd (backfill uses default sort).
+    Uses the same SCRAPE_TARGETS structure for all emirates + commercial.
     Each target gets city and category for proper DDF insertion."""
     targets = []
     for slug, city in EMIRATES:
@@ -998,12 +984,12 @@ if __name__ == "__main__":
             # New: backfill ALL emirates + commercial (140 targets × 249 pages)
             targets = BACKFILL_ALL_TARGETS
             logger.info(f"=== FULL BACKFILL (all emirates): {len(targets)} targets, {max_pg} pages each ===")
-            run_scraper(max_pages=max_pg, custom_targets=targets, smart_stop=False)
+            run_scraper(max_pages=max_pg, custom_targets=targets)
         elif batch in BACKFILL_BATCHES:
             # Legacy: Dubai bedroom+price split batches
             targets = BACKFILL_BATCHES[batch]
             logger.info(f"=== FULL BACKFILL: batch={batch}, {len(targets)} targets, {max_pg} pages each ===")
-            run_scraper(max_pages=max_pg, custom_targets=targets, smart_stop=False)
+            run_scraper(max_pages=max_pg, custom_targets=targets)
         else:
             logger.error(f"Invalid batch: {batch}. Use 1, 2, 3, all, or all-emirates")
             sys.exit(1)
