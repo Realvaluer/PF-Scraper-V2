@@ -847,7 +847,7 @@ def _search_rv_transactions(rv_url: str, building: str, bed_int: int) -> list[di
     # Only match actual sales (not mortgage) / new rentals (not renewals)
     is_sales = rv_url == RV_SALES_URL
     type_filter_key = "subtype" if is_sales else "rent_type_name"
-    type_filter_val = "in.(Sale,Pre-Registration,Delayed Sale,Mortgage Registration,Resale)" if is_sales else "eq.New"
+    type_filter_val = "in.(Sale,Pre-Registration,Delayed Sale,Resale)" if is_sales else "eq.New"
 
     def _try_search(search_term: str, limit: int = 20) -> list[dict]:
         try:
