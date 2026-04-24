@@ -502,24 +502,52 @@ def compute_dip_for_row(row_id: int) -> bool:
         if not building or not price or bedrooms is None or not listed_date:
             return False
 
-        # Find matching prior listings
-        params = {
-            "select": "id,price_aed,listed_date,url,source,size_sqft,furnished,property_name",
-            "property_name": f"eq.{building}",
-            "purpose": f"eq.{purpose}",
-            "bedrooms": f"eq.{bedrooms}",
-            "listed_date": f"lt.{listed_date}",
-            "price_aed": "gt.0",
-            "order": "listed_date.desc",
-            "limit": "50",
-        }
-        if furnished:
-            params["furnished"] = f"eq.{furnished}"
+        # Find matching prior listings — try exact name, then split variant, then fuzzy
+        matches = []
+        search_names = [building]
+        split_name = _split_name_numbers(building)
+        if split_name != building:
+            search_names.append(split_name)
 
-        resp2 = httpx.get(DDF_URL, headers=READ_HEADERS, params=params, timeout=15)
-        if resp2.status_code != 200:
-            return False
-        matches = resp2.json() or []
+        for search_name in search_names:
+            params = {
+                "select": "id,price_aed,listed_date,url,source,size_sqft,furnished,property_name",
+                "property_name": f"eq.{search_name}",
+                "purpose": f"eq.{purpose}",
+                "bedrooms": f"eq.{bedrooms}",
+                "listed_date": f"lt.{listed_date}",
+                "price_aed": "gt.0",
+                "order": "listed_date.desc",
+                "limit": "50",
+            }
+            if furnished:
+                params["furnished"] = f"eq.{furnished}"
+
+            resp2 = httpx.get(DDF_URL, headers=READ_HEADERS, params=params, timeout=15)
+            if resp2.status_code == 200 and resp2.json():
+                matches = resp2.json()
+                break
+
+        # Fallback: fuzzy search (ilike) if exact matches failed
+        if not matches:
+            params = {
+                "select": "id,price_aed,listed_date,url,source,size_sqft,furnished,property_name",
+                "property_name": f"ilike.%{split_name}%",
+                "purpose": f"eq.{purpose}",
+                "bedrooms": f"eq.{bedrooms}",
+                "listed_date": f"lt.{listed_date}",
+                "price_aed": "gt.0",
+                "order": "listed_date.desc",
+                "limit": "50",
+            }
+            if furnished:
+                params["furnished"] = f"eq.{furnished}"
+
+            resp2 = httpx.get(DDF_URL, headers=READ_HEADERS, params=params, timeout=15)
+            if resp2.status_code == 200:
+                candidates = resp2.json() or []
+                # Filter with fuzzy building name match
+                matches = [m for m in candidates if _building_fuzzy_match(building, m.get("property_name", ""))]
 
         # Filter by size ±15%
         if size and int(size) > 0:
@@ -723,6 +751,9 @@ STOP_WORDS = {"dubai", "the", "al", "el", "de", "at", "in", "on", "by"}
 def _normalize_building_name(s: str) -> str:
     """Normalize building name for comparison."""
     s = s.lower().strip()
+    # Split concatenated name+number (DT1 → DT 1, BLVD2 → BLVD 2)
+    s = re.sub(r'([A-Za-z])(\d)', r'\1 \2', s)
+    s = re.sub(r'(\d)([A-Za-z])', r'\1 \2', s)
     s = s.replace('&', 'and')
     s = s.replace('-', ' ')
     s = re.sub(r'\btowers?\b', 'tower', s)
@@ -804,6 +835,11 @@ def _community_fuzzy_match(community_a: str, community_b: str) -> bool:
     return len(overlap) >= max(1, smaller * 0.5)
 
 
+def _split_name_numbers(name: str) -> str:
+    """Split concatenated name+number patterns: DT1 → DT 1, BLVD2 → BLVD 2, Tower3 → Tower 3."""
+    return re.sub(r'([A-Za-z])(\d)', r'\1 \2', re.sub(r'(\d)([A-Za-z])', r'\1 \2', name))
+
+
 def _search_rv_transactions(rv_url: str, building: str, bed_int: int) -> list[dict]:
     """Search RV for matching transactions using multi-strategy approach."""
     select = "id,price,date,size_sqft,community_name,property_name,bedrooms"
@@ -813,44 +849,45 @@ def _search_rv_transactions(rv_url: str, building: str, bed_int: int) -> list[di
     type_filter_key = "subtype" if is_sales else "rent_type_name"
     type_filter_val = "in.(Sale,Pre-Registration,Delayed Sale)" if is_sales else "eq.New"
 
-    # Strategy 1: full building name (case-insensitive)
-    try:
-        resp = httpx.get(rv_url, headers=RV_READ_HEADERS, params={
-            "select": select,
-            "property_name": f"ilike.%{building}%",
-            "bedrooms": f"eq.{bed_int}",
-            "is_valid": "eq.true",
-            "price": "gt.0",
-            type_filter_key: type_filter_val,
-            "order": "date.desc",
-            "limit": "20",
-        }, timeout=15)
-        if resp.status_code == 200 and resp.json():
-            return resp.json()
-    except Exception:
-        pass
-
-    # Strategy 2: progressively shorter name (3 words, 2 words, 1 word)
-    words = building.split()
-    for n_words in range(min(3, len(words)), 0, -1):
-        search = " ".join(words[:n_words])
-        if len(search) < 3:
-            continue
+    def _try_search(search_term: str, limit: int = 20) -> list[dict]:
         try:
             resp = httpx.get(rv_url, headers=RV_READ_HEADERS, params={
                 "select": select,
-                "property_name": f"ilike.%{search}%",
+                "property_name": f"ilike.%{search_term}%",
                 "bedrooms": f"eq.{bed_int}",
                 "is_valid": "eq.true",
                 "price": "gt.0",
                 type_filter_key: type_filter_val,
                 "order": "date.desc",
-                "limit": "30",
+                "limit": str(limit),
             }, timeout=15)
             if resp.status_code == 200 and resp.json():
                 return resp.json()
         except Exception:
             pass
+        return []
+
+    # Strategy 1: full building name (case-insensitive)
+    results = _try_search(building)
+    if results:
+        return results
+
+    # Strategy 2: split concatenated names (DT1 → DT 1, BLVD2 → BLVD 2)
+    split_name = _split_name_numbers(building)
+    if split_name != building:
+        results = _try_search(split_name)
+        if results:
+            return results
+
+    # Strategy 3: progressively shorter name (3 words, 2 words, 1 word)
+    words = split_name.split()
+    for n_words in range(min(3, len(words)), 0, -1):
+        search = " ".join(words[:n_words])
+        if len(search) < 3:
+            continue
+        results = _try_search(search, limit=30)
+        if results:
+            return results
 
     return []
 
