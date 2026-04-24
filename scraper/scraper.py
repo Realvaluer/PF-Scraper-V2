@@ -19,8 +19,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_PAGES_PER_TARGET = 5
+MAX_PAGES_PER_TARGET = 10
 BACKFILL_DEFAULT_PAGES = 50
+MIN_COMMUNITY_LISTINGS = 50  # Only create community targets for communities with 50+ listings
 
 # ── Helper to generate targets ────────────────────────────────────────────────
 
@@ -69,6 +70,70 @@ def _build_targets():
     return targets
 
 SCRAPE_TARGETS = _build_targets()
+
+
+def _extract_apartment_communities(page, emirate_slug: str, city_name: str) -> list[dict]:
+    """Extract apartment community targets from PF's aggregationLinks.
+    Returns community-level targets for both rent and sale."""
+    targets = []
+
+    for purpose, stored_type, type_slug in [
+        ("rent", "rent", "apartments-for-rent"),
+        ("buy", "sale", "apartments-for-sale"),
+    ]:
+        url = f"{PF_BASE}/{purpose}/{emirate_slug}/{type_slug}.html"
+        try:
+            logger.info(f"Extracting {city_name} apartment communities ({stored_type})...")
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+
+            try:
+                page.wait_for_selector('script#__NEXT_DATA__', timeout=10000)
+            except Exception:
+                pass
+
+            content = page.content()
+            start = content.find('id="__NEXT_DATA__"')
+            if start == -1:
+                logger.warning(f"No __NEXT_DATA__ for {city_name} {stored_type}")
+                continue
+            json_start = content.find(">", start) + 1
+            json_end = content.find("</script>", json_start)
+            data = json.loads(content[json_start:json_end])
+
+            agg_links = (
+                data.get("props", {})
+                .get("pageProps", {})
+                .get("pageMeta", {})
+                .get("aggregationLinks", [])
+            )
+
+            community_count = 0
+            for link_data in agg_links:
+                name = link_data.get("name", "")
+                link = link_data.get("link", "")
+                count = link_data.get("count", 0)
+
+                if count >= MIN_COMMUNITY_LISTINGS and link:
+                    full_url = f"https://www.propertyfinder.ae{link}"
+                    targets.append({
+                        "url": full_url,
+                        "label": f"{city_name} {name} Apt ({stored_type})",
+                        "stored_type": stored_type,
+                        "property_type": "apartment",
+                        "city": city_name,
+                        "category": "Residential",
+                    })
+                    community_count += 1
+
+            logger.info(f"Found {community_count} communities for {city_name} Apt ({stored_type}) with {MIN_COMMUNITY_LISTINGS}+ listings")
+            time.sleep(random.uniform(2, 4))
+
+        except Exception as e:
+            logger.warning(f"Failed to extract communities for {city_name} {stored_type}: {e}")
+
+    return targets
+
 
 # ── Full Backfill Targets (bedroom + price splits to stay under 249 pages) ────
 
@@ -490,11 +555,8 @@ def send_resend_notification(
 
 def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_targets: list[dict] = None):
     pages = max_pages or MAX_PAGES_PER_TARGET
-    targets = custom_targets or SCRAPE_TARGETS
-    if property_types and not custom_targets:
-        targets = [t for t in targets if t["property_type"] in property_types]
+    use_communities = custom_targets is None  # Only use community extraction for default daily runs
     start_time = datetime.now(timezone.utc)
-    logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets) ===")
 
     all_listings = []
     all_new_ddf_ids = []
@@ -531,6 +593,32 @@ def run_scraper(max_pages: int = None, property_types: list[str] = None, custom_
 
         pass_waf_challenge(page)
         time.sleep(random.uniform(3, 5))
+
+        # Build targets: community-level for Dubai apartments, broad for everything else
+        if custom_targets:
+            targets = custom_targets
+        elif use_communities:
+            # Extract Dubai apartment communities dynamically
+            dubai_communities = _extract_apartment_communities(page, "dubai", "Dubai")
+
+            if dubai_communities:
+                # Remove broad Dubai apartment targets (replaced by community targets)
+                broad_targets = [
+                    t for t in SCRAPE_TARGETS
+                    if not (t["city"] == "Dubai" and t["property_type"] == "apartment")
+                ]
+                targets = dubai_communities + broad_targets
+                logger.info(f"Built {len(targets)} targets ({len(dubai_communities)} Dubai apartment communities + {len(broad_targets)} broad)")
+            else:
+                logger.warning("Community extraction failed — falling back to broad targets")
+                targets = SCRAPE_TARGETS
+        else:
+            targets = SCRAPE_TARGETS
+
+        if property_types:
+            targets = [t for t in targets if t["property_type"] in property_types]
+
+        logger.info(f"=== PF Scraper V2 started at {start_time.isoformat()} ({pages} pages, {len(targets)} targets) ===")
 
         for idx, target in enumerate(targets):
             label = target["label"]
@@ -753,22 +841,17 @@ def _detect_price_changes(page_listings: list[dict], stored_type: str) -> int:
 
 # ── Deep Refresh (weekly) ────────────────────────────────────────────────────
 
-DEEP_REFRESH_PAGES = 30
+DEEP_REFRESH_PAGES = 20
 
 
 def run_deep_refresh():
-    """Weekly deep refresh: scrape 30 pages per target (no smart stop),
-    then detect delisted listings and cleanup duplicates."""
-    logger.info("=== DEEP REFRESH: 30 pages per target, no smart stop ===")
-
-    # Use the same targets as daily but without smart stop
-    targets = SCRAPE_TARGETS
+    """Weekly deep refresh: community-level for all emirates apartments (20 pages),
+    broad for other types, then detect delisted listings and cleanup duplicates."""
+    logger.info("=== DEEP REFRESH: community-level apartments, 20 pages per target ===")
 
     # Collect all scraped reference_nos for delisted detection
     all_scraped_refs = set()
 
-    # Wrap run_scraper to also collect refs
-    # Run with max_pages=30 (deep refresh)
     start_time = datetime.now(timezone.utc)
 
     all_listings = []
@@ -803,6 +886,23 @@ def run_deep_refresh():
 
         pass_waf_challenge(page)
         time.sleep(random.uniform(3, 5))
+
+        # Extract apartment communities for ALL emirates
+        all_community_targets = []
+        for slug, city in EMIRATES:
+            communities = _extract_apartment_communities(page, slug, city)
+            all_community_targets.extend(communities)
+            time.sleep(random.uniform(2, 4))
+
+        # Non-apartment broad targets
+        broad_targets = [t for t in SCRAPE_TARGETS if t["property_type"] != "apartment"]
+
+        if all_community_targets:
+            targets = all_community_targets + broad_targets
+            logger.info(f"Built {len(targets)} targets ({len(all_community_targets)} apartment communities + {len(broad_targets)} broad)")
+        else:
+            logger.warning("Community extraction failed — falling back to broad targets")
+            targets = SCRAPE_TARGETS
 
         for idx, target in enumerate(targets):
             label = target["label"]
